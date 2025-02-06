@@ -184,8 +184,7 @@ async fn export_all(conexion: &Conexion) -> Result<()> {
     for row in rows {
         let decoded = BASE64_STANDARD.decode(row.get::<String, _>(1))?;
         let decrypt = decrypt(decoded)?;
-        let mut result = String::from_utf8(decrypt)?;
-        result.retain(|c| c != '\0');
+        let result = String::from_utf8(decrypt)?;
         writeln!(file, "{},{}", row.get::<String, _>(0), result)?;
     }
 
