@@ -2,6 +2,10 @@
 
 A simple key store
 
+Key is encrypted with AES 256, Salt and IV use thread_rng() from AesEncryptor.
+
+Keys are stored in db/db.db encrypted and base64-encoded.
+
 ## Environment Variables
 
 To run this project, you will need to change the `PWD` environment var to your .env file.
@@ -22,7 +26,7 @@ Go to the project directory
   cd almacen
 ```
 
-Install & Run
+Run
 
 ```bash
   cargo run
@@ -31,6 +35,7 @@ Install & Run
 ## Menu
 ```bash
 s -> Setup
+a -> Add
 v -> View
 i -> Import
 e -> Export
@@ -38,4 +43,4 @@ q -> Quit
 ```
 ## Authors
 
-- [@abr3lak3bra](https://github.com/abr3lak3bra)
+- [abr3lak3bra](https://github.com/abr3lak3bra)
