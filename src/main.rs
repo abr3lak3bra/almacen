@@ -1,26 +1,32 @@
-use cryptojs_rust::aes::{AesEncryptor, AesDecryptor};
-use cryptojs_rust::{CryptoOperation, Mode};
-use comfy_table::{Table, Cell, Row as cRow};
-use sqlx::sqlite::SqliteConnectOptions;
-use comfy_table::modifiers::UTF8_ROUND_CORNERS;
-use comfy_table::presets::UTF8_NO_BORDERS;
-use comfy_table::CellAlignment;
 use inquire::Text;
 use anyhow::{bail, Result};
 use base64::prelude::*;
 use dotenv::dotenv;
-use colored::*;
-use std::{ 
-    path::Path,
-    io::Write, 
-    fs::File, 
-    fs
+use colored::Colorize;
+use cryptojs_rust::{
+    aes::{
+        AesEncryptor, AesDecryptor
+    }, CryptoOperation, Mode
+};
+use comfy_table::{
+    Table, 
+    Cell, 
+    Row as cRow, 
+    modifiers::UTF8_ROUND_CORNERS, 
+    presets::UTF8_NO_BORDERS, 
+    CellAlignment
 };
 use sqlx::{
+    sqlite::SqliteConnectOptions, 
     migrate::MigrateDatabase, 
-    SqlitePool,
-    Sqlite,
+    SqlitePool, 
+    Sqlite, 
     Row
+};
+use std::{
+    fs::{
+        self, File
+    }, io::Write, path::Path
 };
 
 struct Almacen {
