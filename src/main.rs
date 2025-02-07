@@ -1,43 +1,31 @@
-use inquire::Text;
 use anyhow::{bail, Result};
 use base64::prelude::*;
-use dotenv::dotenv;
 use colored::Colorize;
-use cryptojs_rust::{
-    aes::{
-        AesEncryptor, AesDecryptor
-    }, CryptoOperation, Mode
-};
 use comfy_table::{
-    Table, 
-    Cell, 
-    Row as cRow, 
-    modifiers::UTF8_ROUND_CORNERS, 
-    presets::UTF8_NO_BORDERS, 
-    CellAlignment
+    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
+    Table,
 };
-use sqlx::{
-    sqlite::SqliteConnectOptions, 
-    migrate::MigrateDatabase, 
-    SqlitePool, 
-    Sqlite, 
-    Row
+use cryptojs_rust::{
+    aes::{AesDecryptor, AesEncryptor},
+    CryptoOperation, Mode,
 };
+use dotenv::dotenv;
+use inquire::Text;
+use sqlx::{migrate::MigrateDatabase, sqlite::SqliteConnectOptions, Row, Sqlite, SqlitePool};
 use std::{
-    fs::{
-        self, File
-    }, path::Path
+    fs::{self, File},
+    path::Path,
 };
 
 struct Almacen {
     nombre: String,
-    key: String
+    key: String,
 }
 struct Conexion {
-    pool: SqlitePool
+    pool: SqlitePool,
 }
 struct Password {
-    pwd: String
+    pwd: String,
 }
 
 const DB: &str = "./db/db.db";
@@ -48,7 +36,9 @@ const FILE_IMPORT: &str = "./files/importar_datos.csv";
 impl Conexion {
     async fn new() -> Result<Self> {
         if !Sqlite::database_exists(DB).await? {
-            if !Path::new(DB_PATH).exists() { fs::create_dir(DB_PATH)?; }
+            if !Path::new(DB_PATH).exists() {
+                fs::create_dir(DB_PATH)?;
+            }
             Sqlite::create_database(DB).await?;
         }
 
@@ -57,7 +47,7 @@ impl Conexion {
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
 
         Ok(Self {
-            pool: SqlitePool::connect_with(op).await?
+            pool: SqlitePool::connect_with(op).await?,
         })
     }
 }
@@ -65,7 +55,7 @@ impl Conexion {
 impl Password {
     fn new() -> Result<Self> {
         Ok(Self {
-            pwd: dotenv::var("PWD")?
+            pwd: dotenv::var("PWD")?,
         })
     }
 }
@@ -121,12 +111,8 @@ fn decrypt(data: Vec<u8>) -> Result<Vec<u8>> {
     let iv = &data[16..32];
     let ciphertext = &data[32..];
 
-    let mut decryptor = AesDecryptor::new_256_from_password(
-        pwd.pwd.as_bytes(), 
-        Mode::CBC, 
-        salt, 
-        Some(iv) 
-    )?;
+    let mut decryptor =
+        AesDecryptor::new_256_from_password(pwd.pwd.as_bytes(), Mode::CBC, salt, Some(iv))?;
 
     decryptor.update(ciphertext)?;
     Ok(decryptor.finalize()?)
@@ -162,18 +148,20 @@ async fn view_all(conexion: &Conexion, inicio: &u16, fin: &u16) -> Result<()> {
         .await?;
 
     if rows.is_empty() {
-        bail!("No hay registros en el rango especificado.");
+        bail!("No hay registros en el rango especificado");
     }
 
     let total = rows.len();
     let mut tabla = Table::new();
 
-    tabla.load_preset(UTF8_NO_BORDERS).apply_modifier(UTF8_ROUND_CORNERS);
+    tabla
+        .load_preset(UTF8_NO_BORDERS)
+        .apply_modifier(UTF8_ROUND_CORNERS);
     tabla.set_header(vec![
         Cell::new("Nombre"),
         Cell::new("Key").set_alignment(CellAlignment::Center),
     ]);
-    
+
     for row in rows {
         let decoded = BASE64_STANDARD.decode(row.get::<String, _>(1))?;
         let decrypted = decrypt(decoded)?;
@@ -183,8 +171,11 @@ async fn view_all(conexion: &Conexion, inicio: &u16, fin: &u16) -> Result<()> {
             Cell::new(String::from_utf8(decrypted)?),
         ]));
     }
-    println!("{}\n", tabla);
-    println!("Mostrando registros del {} al {} - Total: {}", &inicio, &fin, &total);
+    println!("{}\n", &tabla);
+    println!(
+        "Mostrando registros del {} al {} - Total: {}",
+        &inicio, &fin, &total
+    );
 
     Ok(())
 }
@@ -211,22 +202,26 @@ async fn import_all(conexion: &Conexion) -> Result<()> {
         .has_headers(false)
         .from_path(FILE_IMPORT)?;
 
-    for line in reader.records() {   
+    for line in reader.records() {
         let record = line?;
 
         if record[0].is_empty() {
             bail!("empty name {}", &record[0]);
         } else if record[1].is_empty() {
-            bail!("empty key for name: {}", &record[0])
+            bail!("empty key for name: {}", &record[0]);
         }
 
         let converted = convert(&record[1])?;
         let encrypted = encrypt(&converted)?;
-    
-        add(conexion, &Almacen {
-            nombre: record[0].to_string(),
-            key: BASE64_STANDARD.encode(&encrypted),
-        }).await?;
+
+        add(
+            conexion,
+            &Almacen {
+                nombre: record[0].to_string(),
+                key: BASE64_STANDARD.encode(&encrypted),
+            },
+        )
+        .await?;
     }
 
     Ok(())
@@ -240,16 +235,18 @@ async fn main() -> Result<()> {
     let conexion = Conexion::new().await?;
 
     loop {
-        println!("{}, {}, {}, {}, {}, {}, {} - abr{}lak{}bra", 
-            "s".red(), 
-            "a".green(), 
+        println!(
+            "{}, {}, {}, {}, {}, {}, {} - abr{}lak{}bra",
+            "s".red(),
+            "a".green(),
             "v".cyan(),
-            "i".purple(), 
-            "e".blue(), 
-            "r".cyan(), 
-            "q".blue(), 
-            "3".green(), 
-            "3".green());
+            "i".purple(),
+            "e".blue(),
+            "r".cyan(),
+            "q".blue(),
+            "3".green(),
+            "3".green()
+        );
 
         println!(" ");
 
@@ -260,17 +257,21 @@ async fn main() -> Result<()> {
             ["s"] => {
                 create_schema(&conexion).await?;
                 clear_console();
-            },
+            }
             ["a", nombre, key] => {
                 let converted = convert(key)?;
                 let encrypted = encrypt(&converted)?;
 
-                add(&conexion, &Almacen {
-                    nombre: nombre.to_string(),
-                    key: BASE64_STANDARD.encode(&encrypted)
-                }).await?;
+                add(
+                    &conexion,
+                    &Almacen {
+                        nombre: nombre.to_string(),
+                        key: BASE64_STANDARD.encode(&encrypted),
+                    },
+                )
+                .await?;
                 clear_console();
-            },
+            }
             ["v", inicio, fin] => {
                 clear_console();
                 println!(" ");
@@ -278,23 +279,23 @@ async fn main() -> Result<()> {
                 let pg_fin = fin.parse::<u16>()?;
                 view_all(&conexion, &pg_inicio, &pg_fin).await?;
                 println!(" ");
-            },
+            }
             ["e"] => {
                 export_all(&conexion).await?;
                 clear_console();
-            },
+            }
             ["i"] => {
                 import_all(&conexion).await?;
                 clear_console();
-            },
+            }
             ["r", nombre] => {
                 remove(&conexion, nombre).await;
                 clear_console();
-            },
+            }
             ["q"] => {
                 println!("Saliendo...");
                 break;
-            },
+            }
             _ => {
                 clear_console();
             }
