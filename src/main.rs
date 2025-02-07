@@ -26,7 +26,7 @@ use sqlx::{
 use std::{
     fs::{
         self, File
-    }, io::Write, path::Path
+    }, path::Path
 };
 
 struct Almacen {
@@ -75,15 +75,17 @@ fn clear_console() {
 }
 
 fn convert(data: &str) -> Result<Vec<u8>> {
-    let len = data.len();
-    let mut vec = vec![0u8; len];
+    let mut vec = vec![0; data.len()];
 
-    if data.is_empty() {
-        bail!("Error: Data is empty");
-    }
-
-    vec[..len].copy_from_slice(data.as_bytes());
+    vec[..data.len()].copy_from_slice(data.as_bytes());
     Ok(vec)
+}
+
+async fn remove(conexion: &Conexion, nombre: &str) {
+    let _ = sqlx::query("DELETE FROM Almacen WHERE nombre = ?")
+        .bind(nombre)
+        .execute(&conexion.pool)
+        .await;
 }
 
 async fn create_schema(conexion: &Conexion) -> Result<()> {
@@ -131,11 +133,18 @@ fn decrypt(data: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 async fn add(conexion: &Conexion, data: &Almacen) -> Result<()> {
+    let exist = sqlx::query("SELECT id FROM Almacen WHERE nombre = ?")
+        .bind(&data.nombre)
+        .fetch_optional(&conexion.pool)
+        .await?;
+
+    if exist.is_some() {
+        bail!("Name: {} already exist", &data.nombre);
+    }
+
     let transaction = conexion.pool.begin().await?;
 
-    let qry = "INSERT INTO Almacen (nombre, key) VALUES (?1, ?2);";
-
-    sqlx::query(qry)
+    sqlx::query("INSERT INTO Almacen (nombre, key) VALUES (?, ?)")
         .bind(&data.nombre)
         .bind(&data.key)
         .execute(&conexion.pool)
@@ -145,10 +154,16 @@ async fn add(conexion: &Conexion, data: &Almacen) -> Result<()> {
     Ok(())
 }
 
-async fn view_all(conexion: &Conexion) -> Result<()> {
-    let rows = sqlx::query("SELECT nombre, key FROM Almacen")
+async fn view_all(conexion: &Conexion, inicio: &u16, fin: &u16) -> Result<()> {
+    let rows = sqlx::query("SELECT nombre, key FROM Almacen ORDER BY id LIMIT $1 OFFSET $2")
+        .bind(fin - inicio)
+        .bind(inicio)
         .fetch_all(&conexion.pool)
         .await?;
+
+    if rows.is_empty() {
+        bail!("No hay registros en el rango especificado.");
+    }
 
     let total = rows.len();
     let mut tabla = Table::new();
@@ -169,7 +184,7 @@ async fn view_all(conexion: &Conexion) -> Result<()> {
         ]));
     }
     println!("{}\n", tabla);
-    println!("Total Registros: {}", &total);
+    println!("Mostrando registros del {} al {} - Total: {}", &inicio, &fin, &total);
 
     Ok(())
 }
@@ -179,33 +194,37 @@ async fn export_all(conexion: &Conexion) -> Result<()> {
         .fetch_all(&conexion.pool)
         .await?;
 
-    let mut file = File::create(FILE_EXPORT)?;
+    let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
 
     for row in rows {
         let decoded = BASE64_STANDARD.decode(row.get::<String, _>(1))?;
         let decrypt = decrypt(decoded)?;
         let result = String::from_utf8(decrypt)?;
-        writeln!(file, "{},{}", row.get::<String, _>(0), result)?;
+        writer.write_record(&[row.get::<String, _>(0), result])?;
     }
 
     Ok(())
 }
 
 async fn import_all(conexion: &Conexion) -> Result<()> {
-    let contents = fs::read_to_string(FILE_IMPORT)?;
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(FILE_IMPORT)?;
 
-    for line in contents.lines() {
-        let parts = &line.split(",").map(|s| s.trim()).collect::<Vec<&str>>();
+    for line in reader.records() {   
+        let record = line?;
 
-        if parts.len() != 2 {
-            bail!("Error: Incorrect number of arguments");
+        if record[0].is_empty() {
+            bail!("empty name {}", &record[0]);
+        } else if record[1].is_empty() {
+            bail!("empty key for name: {}", &record[0])
         }
 
-        let converted = convert(parts[1])?;
+        let converted = convert(&record[1])?;
         let encrypted = encrypt(&converted)?;
-
+    
         add(conexion, &Almacen {
-            nombre: parts[0].to_string(),
+            nombre: record[0].to_string(),
             key: BASE64_STANDARD.encode(&encrypted),
         }).await?;
     }
@@ -221,12 +240,13 @@ async fn main() -> Result<()> {
     let conexion = Conexion::new().await?;
 
     loop {
-        println!("{}, {}, {}, {}, {}, {} - abr{}lak{}bra", 
+        println!("{}, {}, {}, {}, {}, {}, {} - abr{}lak{}bra", 
             "s".red(), 
             "a".green(), 
             "v".cyan(),
             "i".purple(), 
             "e".blue(), 
+            "r".cyan(), 
             "q".blue(), 
             "3".green(), 
             "3".green());
@@ -234,7 +254,6 @@ async fn main() -> Result<()> {
         println!(" ");
 
         let entrada = Text::new("").prompt()?;
-
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
@@ -252,10 +271,12 @@ async fn main() -> Result<()> {
                 }).await?;
                 clear_console();
             },
-            ["v"] => {
+            ["v", inicio, fin] => {
                 clear_console();
                 println!(" ");
-                view_all(&conexion).await?;
+                let pg_inicio = inicio.parse::<u16>()?;
+                let pg_fin = fin.parse::<u16>()?;
+                view_all(&conexion, &pg_inicio, &pg_fin).await?;
                 println!(" ");
             },
             ["e"] => {
@@ -264,6 +285,10 @@ async fn main() -> Result<()> {
             },
             ["i"] => {
                 import_all(&conexion).await?;
+                clear_console();
+            },
+            ["r", nombre] => {
+                remove(&conexion, nombre).await;
                 clear_console();
             },
             ["q"] => {

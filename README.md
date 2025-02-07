@@ -1,8 +1,6 @@
-# Almacen
+# Almacen - Simple key store
 
-A simple key store
-
-Key is encrypted with AES 256, Salt and IV use thread_rng() from AesEncryptor.
+Key is encrypted with AES 256, Salt and IV use thread_rng() from fn AesEncryptor (cryptojs_rust).
 
 Keys are stored in db/db.db encrypted and base64-encoded.
 
@@ -10,7 +8,7 @@ Keys are stored in db/db.db encrypted and base64-encoded.
 
 To run this project, you will need to change the `PWD` environment var to your .env file.
 
-WARNING! delete `PWD` var or delete .env file after use
+WARNING! delete `PWD` environment var or delete .env file after use.
 
 ## Run
 
@@ -32,15 +30,16 @@ Run
   cargo run
 ```
 
-## Menu
+## Menu Usage
 ```bash
 s -> Setup
-a -> Add
-v -> View
+a -> Add -> Usage: a testi1 0xac....
+v -> View -> Usage: v 0 10 -> this will display records from id 0 to 10
 i -> Import
 e -> Export
+r -> Remove -> Usage: r testi1
 q -> Quit
 ```
-## Authors
+## Author
 
 - [abr3lak3bra](https://github.com/abr3lak3bra)
