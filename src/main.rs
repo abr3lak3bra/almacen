@@ -1,29 +1,39 @@
+use crate::schema::almacen::dsl as almacen_dsl;
+use crate::models::Registro;
+use inquire::Text;
+use models::Almacen;
 use anyhow::{bail, Result};
 use base64::prelude::*;
 use colored::Colorize;
 use comfy_table::{
-    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
+    modifiers::UTF8_ROUND_CORNERS, 
+    presets::UTF8_NO_BORDERS, 
+    Cell, 
+    CellAlignment, 
+    Row as cRow,
     Table,
 };
 use cryptojs_rust::{
     aes::{AesDecryptor, AesEncryptor},
     CryptoOperation, Mode,
 };
-use dotenv::dotenv;
-use inquire::Text;
-use sqlx::{migrate::MigrateDatabase, sqlite::SqliteConnectOptions, Row, Sqlite, SqlitePool};
+use diesel::{
+    prelude::*,
+    sqlite::SqliteConnection,
+};
 use std::{
+    env,
     fs::{self, File},
     path::Path,
 };
 
-struct Almacen {
-    nombre: String,
-    key: String,
-}
+pub mod models;
+pub mod schema;
+
 struct Conexion {
-    pool: SqlitePool,
+    pool: SqliteConnection,
 }
+
 struct Password {
     pwd: String,
 }
@@ -34,20 +44,13 @@ const FILE_EXPORT: &str = "./files/exportar_datos.csv";
 const FILE_IMPORT: &str = "./files/importar_datos.csv";
 
 impl Conexion {
-    async fn new() -> Result<Self> {
-        if !Sqlite::database_exists(DB).await? {
-            if !Path::new(DB_PATH).exists() {
-                fs::create_dir(DB_PATH)?;
-            }
-            Sqlite::create_database(DB).await?;
+    fn new() -> Result<Self> {
+        if !Path::new(DB_PATH).exists() {
+            fs::create_dir(DB_PATH)?;
         }
 
-        let op = SqliteConnectOptions::new()
-            .filename(DB)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete);
-
         Ok(Self {
-            pool: SqlitePool::connect_with(op).await?,
+            pool: SqliteConnection::establish(DB)?,
         })
     }
 }
@@ -55,7 +58,7 @@ impl Conexion {
 impl Password {
     fn new() -> Result<Self> {
         Ok(Self {
-            pwd: dotenv::var("PWD")?,
+            pwd: env::var("PWD")?,
         })
     }
 }
@@ -64,21 +67,7 @@ fn clear_console() {
     print!("\x1B[2J\x1B[1;1H");
 }
 
-fn convert(data: &str) -> Result<Vec<u8>> {
-    let mut vec = vec![0; data.len()];
-
-    vec[..data.len()].copy_from_slice(data.as_bytes());
-    Ok(vec)
-}
-
-async fn remove(conexion: &Conexion, nombre: &str) {
-    let _ = sqlx::query("DELETE FROM Almacen WHERE nombre = ?")
-        .bind(nombre)
-        .execute(&conexion.pool)
-        .await;
-}
-
-async fn create_schema(conexion: &Conexion) -> Result<()> {
+fn create_schema(conexion: &mut Conexion) -> Result<()> {
     let data = "
         CREATE TABLE IF NOT EXISTS Almacen (
             id INTEGER PRIMARY KEY,
@@ -90,7 +79,19 @@ async fn create_schema(conexion: &Conexion) -> Result<()> {
         CREATE INDEX IF NOT EXISTS id_key ON Almacen(key);
     ";
 
-    sqlx::query(data).execute(&conexion.pool).await?;
+    diesel::sql_query(data).execute(&mut conexion.pool)?;
+    Ok(())
+}
+
+fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
+    let rows = diesel::delete(almacen_dsl::almacen
+        .filter(almacen_dsl::nombre.eq(name)))
+        .execute(&mut conexion.pool)?;
+
+    if rows == 0 {
+        bail!("No record found with name: {}", name);
+    }
+
     Ok(())
 }
 
@@ -106,7 +107,6 @@ fn encrypt(data: &[u8]) -> Result<Vec<u8>> {
 fn decrypt(data: Vec<u8>) -> Result<Vec<u8>> {
     let pwd = Password::new()?;
 
-    // [16 bytes salt][16 bytes IV][ciphertext]
     let salt = &data[..16];
     let iv = &data[16..32];
     let ciphertext = &data[32..];
@@ -118,56 +118,54 @@ fn decrypt(data: Vec<u8>) -> Result<Vec<u8>> {
     Ok(decryptor.finalize()?)
 }
 
-async fn add(conexion: &Conexion, data: &Almacen) -> Result<()> {
-    let exist = sqlx::query("SELECT id FROM Almacen WHERE nombre = ?")
-        .bind(&data.nombre)
-        .fetch_optional(&conexion.pool)
-        .await?;
-
-    if exist.is_some() {
+fn add(conexion: &mut Conexion, data: &Almacen) -> Result<()> {
+    if almacen_dsl::almacen
+        .filter(almacen_dsl::nombre.eq(&data.nombre))
+        .count()
+        .get_result::<i64>(&mut conexion.pool)?
+        > 0
+    {
         bail!("Name: {} already exist", &data.nombre);
     }
 
-    let transaction = conexion.pool.begin().await?;
+    diesel::insert_into(almacen_dsl::almacen)
+        .values(Registro {
+            nombre: &data.nombre,
+            key: &data.key,
+        })
+        .execute(&mut conexion.pool)?;
 
-    sqlx::query("INSERT INTO Almacen (nombre, key) VALUES (?, ?)")
-        .bind(&data.nombre)
-        .bind(&data.key)
-        .execute(&conexion.pool)
-        .await?;
-
-    transaction.commit().await?;
     Ok(())
 }
 
-async fn view_all(conexion: &Conexion, inicio: &u16, fin: &u16) -> Result<()> {
-    let rows = sqlx::query("SELECT nombre, key FROM Almacen ORDER BY id LIMIT $1 OFFSET $2")
-        .bind(fin - inicio)
-        .bind(inicio)
-        .fetch_all(&conexion.pool)
-        .await?;
+fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
+    let results = almacen_dsl::almacen
+        .limit((fin - inicio) as i64)
+        .offset(*inicio as i64)
+        .load::<Almacen>(&mut conexion.pool)?;
 
-    if rows.is_empty() {
+    if results.is_empty() {
         bail!("No hay registros en el rango especificado");
     }
 
-    let total = rows.len();
+    let total = results.len();
     let mut tabla = Table::new();
 
     tabla
         .load_preset(UTF8_NO_BORDERS)
         .apply_modifier(UTF8_ROUND_CORNERS);
+
     tabla.set_header(vec![
         Cell::new("Nombre"),
         Cell::new("Key").set_alignment(CellAlignment::Center),
     ]);
 
-    for row in rows {
-        let decoded = BASE64_STANDARD.decode(row.get::<String, _>(1))?;
+    for row in results {
+        let decoded = BASE64_STANDARD.decode(&row.key)?;
         let decrypted = decrypt(decoded)?;
 
         tabla.add_row(cRow::from(vec![
-            Cell::new(row.get::<String, _>(0)),
+            Cell::new(row.nombre),
             Cell::new(String::from_utf8(decrypted)?),
         ]));
     }
@@ -180,24 +178,22 @@ async fn view_all(conexion: &Conexion, inicio: &u16, fin: &u16) -> Result<()> {
     Ok(())
 }
 
-async fn export_all(conexion: &Conexion) -> Result<()> {
-    let rows = sqlx::query("SELECT nombre, key FROM Almacen")
-        .fetch_all(&conexion.pool)
-        .await?;
+fn export_all(conexion: &mut Conexion) -> Result<()> {
+    let results = almacen_dsl::almacen.load::<Almacen>(&mut conexion.pool)?;
 
     let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
 
-    for row in rows {
-        let decoded = BASE64_STANDARD.decode(row.get::<String, _>(1))?;
-        let decrypt = decrypt(decoded)?;
-        let result = String::from_utf8(decrypt)?;
-        writer.write_record(&[row.get::<String, _>(0), result])?;
+    for row in results {
+        let decoded = BASE64_STANDARD.decode(&row.key)?;
+        let decrypted = decrypt(decoded)?;
+        let result = String::from_utf8(decrypted)?;
+        writer.write_record(&[row.nombre, result])?;
     }
 
     Ok(())
 }
 
-async fn import_all(conexion: &Conexion) -> Result<()> {
+fn import_all(conexion: &mut Conexion) -> Result<()> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_path(FILE_IMPORT)?;
@@ -211,32 +207,30 @@ async fn import_all(conexion: &Conexion) -> Result<()> {
             bail!("empty key for name: {}", &record[0]);
         }
 
-        let converted = convert(&record[1])?;
-        let encrypted = encrypt(&converted)?;
+        let encrypted = encrypt(record[1].as_bytes())?;
 
-        add(
-            conexion,
-            &Almacen {
-                nombre: record[0].to_string(),
-                key: BASE64_STANDARD.encode(&encrypted),
-            },
-        )
-        .await?;
+        let _almacen = Almacen {
+            id: 0, // Diesel
+            nombre: record[0].to_string(),
+            key: BASE64_STANDARD.encode(&encrypted),
+        };
+
+        add(conexion, &_almacen)?;
     }
 
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     clear_console();
-    dotenv().ok();
+    dotenvy::dotenv()?;
 
-    let conexion = Conexion::new().await?;
+    let mut conexion = Conexion::new()?;
 
     loop {
         println!(
             "{}, {}, {}, {}, {}, {}, {} - abr{}lak{}bra",
+
             "s".red(),
             "a".green(),
             "v".cyan(),
@@ -255,21 +249,20 @@ async fn main() -> Result<()> {
 
         match partes.as_slice() {
             ["s"] => {
-                create_schema(&conexion).await?;
+                create_schema(&mut conexion)?;
                 clear_console();
             }
-            ["a", nombre, key] => {
-                let converted = convert(key)?;
-                let encrypted = encrypt(&converted)?;
+            ["a", _nombre, _key] => {
+                let encrypted = encrypt(_key.as_bytes())?;
 
                 add(
-                    &conexion,
+                    &mut conexion,
                     &Almacen {
-                        nombre: nombre.to_string(),
+                        id: 0, // Diesel
+                        nombre: _nombre.to_string(),
                         key: BASE64_STANDARD.encode(&encrypted),
                     },
-                )
-                .await?;
+                )?;
                 clear_console();
             }
             ["v", inicio, fin] => {
@@ -277,19 +270,19 @@ async fn main() -> Result<()> {
                 println!(" ");
                 let pg_inicio = inicio.parse::<u16>()?;
                 let pg_fin = fin.parse::<u16>()?;
-                view_all(&conexion, &pg_inicio, &pg_fin).await?;
+                view_all(&mut conexion, &pg_inicio, &pg_fin)?;
                 println!(" ");
             }
             ["e"] => {
-                export_all(&conexion).await?;
+                export_all(&mut conexion)?;
                 clear_console();
             }
             ["i"] => {
-                import_all(&conexion).await?;
+                import_all(&mut conexion)?;
                 clear_console();
             }
-            ["r", nombre] => {
-                remove(&conexion, nombre).await;
+            ["r", _nombre] => {
+                remove(&mut conexion, _nombre)?;
                 clear_console();
             }
             ["q"] => {
