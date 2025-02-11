@@ -7,3 +7,11 @@ diesel::table! {
         key -> Text,
     }
 }
+
+diesel::table! {
+    recovery (status) {
+        status -> Bool,
+        hash -> Text,
+        salt -> Text,
+    }
+}
