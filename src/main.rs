@@ -1,4 +1,4 @@
-use crate::models::{Registro, RegistroRecovery};
+use crate::models::{Almacen, Registro, RegistroRecovery};
 use crate::schema::almacen::dsl as almacen_dsl;
 use crate::schema::recovery::dsl as recovery_dsl;
 use anyhow::{bail, Ok, Result};
@@ -16,7 +16,6 @@ use cryptojs_rust::{
 };
 use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
 use inquire::Text;
-use models::Almacen;
 use std::{
     env,
     fs::{self, File},
@@ -25,6 +24,11 @@ use std::{
 
 mod models;
 mod schema;
+
+struct Password {
+    s_master: String,
+    s_salt: SaltString,
+}
 
 struct Conexion {
     pool: SqliteConnection,
@@ -47,102 +51,81 @@ impl Conexion {
     }
 }
 
-fn create_1_instance(conexion: &mut Conexion) -> Result<()> {
-    let master = env::var("PWD")?;
-    let mut new_hash = [0u8; 32];
-    let salt_ = SaltString::generate(&mut OsRng);
-
-    Argon2::default()
-        .hash_password_into(
-            &master.clone().into_bytes(),
-            salt_.to_string().as_bytes(),
-            &mut new_hash,
-        )
-        .unwrap();
-
-    diesel::insert_into(recovery_dsl::recovery)
-        .values(RegistroRecovery {
-            salt: salt_.as_ref(),
-            hash: &BASE64_URL_SAFE.encode(new_hash),
-        })
-        .execute(&mut conexion.pool)?;
-
-    Ok(())
-}
-
-fn create_2_instance(conexion: &mut Conexion) -> Result<String> {
-    let master = env::var("PWD")?;
-    let mut new_hash = [0u8; 32];
-    let salt_ = get_salt_from_db(conexion)?;
-
-    Argon2::default()
-        .hash_password_into(
-            &master.clone().into_bytes(),
-            salt_.to_string().as_bytes(),
-            &mut new_hash,
-        )
-        .expect("first hashing");
-
-    Ok(BASE64_STANDARD.encode(new_hash))
-}
-
-fn get_salt_from_db(conexion: &mut Conexion) -> Result<String> {
-    let result = recovery_dsl::recovery
-        .select(recovery_dsl::salt)
-        .limit(1)
-        .load::<String>(&mut conexion.pool)?;
-
-    if let Some(salt) = result.into_iter().next() {
-        Ok(salt)
-    } else {
-        bail!("No salt found in database")
+impl Default for Password {
+    fn default() -> Self {
+        let master = env::var("PWD").unwrap();
+        let salt_ = SaltString::generate(&mut OsRng);
+        Self::new(master, salt_)
     }
 }
 
-fn get_salt_hash_from_db(conexion: &mut Conexion) -> Result<Option<(String, String)>> {
-    let result = recovery_dsl::recovery
-        .select((recovery_dsl::salt, recovery_dsl::hash))
-        .limit(1)
-        .load::<(String, String)>(&mut conexion.pool)?;
-
-    Ok(result.into_iter().next())
-}
-
-fn verify_hash(hash_new: &str, hash_db: &str) -> Result<()> {
-    let hash_db_bytes = BASE64_URL_SAFE.decode(hash_db)?;
-    let hash_new_bytes = BASE64_URL_SAFE.decode(hash_new)?;
-
-    if hash_new_bytes != hash_db_bytes {
-        bail!("Password verification failed");
+impl Password {
+    fn new(_master: String, salt_: SaltString) -> Self {
+        Self {
+            s_master: _master,
+            s_salt: salt_,
+        }
     }
 
-    Ok(())
-}
+    fn create_instance(&self, conexion: &mut Conexion) -> Result<()> {
+        let mut new_hash = [0u8; 32];
 
-fn clear_console() {
-    print!("\x1B[2J\x1B[1;1H");
-}
+        Argon2::default()
+            .hash_password_into(
+                self.s_master.as_bytes(),
+                self.s_salt.to_string().as_bytes(),
+                &mut new_hash,
+            )
+            .unwrap();
 
-fn check_name(nombre: &str) -> Result<()> {
-    if nombre.len() > 9 {
-        bail!(
-            "El nombre {}... excede el limite de caracteres permitidos",
-            &nombre[0..9]
-        );
+        diesel::insert_into(recovery_dsl::recovery)
+            .values(RegistroRecovery {
+                salt: self.s_salt.as_str(),
+                hash: &BASE64_URL_SAFE.encode(new_hash),
+            })
+            .execute(&mut conexion.pool)?;
+
+        Ok(())
     }
 
-    if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        bail!("El nombre solo puede contener letras, numeros y guiones bajos");
+    fn get_salt_from_db(conexion: &mut Conexion) -> Result<String> {
+        let result = recovery_dsl::recovery
+            .select(recovery_dsl::salt)
+            .limit(1)
+            .load::<String>(&mut conexion.pool)?;
+
+        if let Some(salt) = result.into_iter().next() {
+            Ok(salt)
+        } else {
+            bail!("No salt found in database")
+        }
     }
 
-    Ok(())
+    fn get_salt_hash_from_db(conexion: &mut Conexion) -> Result<Option<(String, String)>> {
+        let result = recovery_dsl::recovery
+            .select((recovery_dsl::salt, recovery_dsl::hash))
+            .first::<(String, String)>(&mut conexion.pool)
+            .optional()?;
+        Ok(result)
+    }
+
+    fn verify_hash(hash_new: &str, hash_db: &str) -> Result<()> {
+        let hash_db_bytes = BASE64_URL_SAFE.decode(hash_db)?;
+        let hash_new_bytes = BASE64_URL_SAFE.decode(hash_new)?;
+
+        if hash_new_bytes != hash_db_bytes {
+            bail!("Password verification failed");
+        }
+
+        Ok(())
+    }
 }
 
 fn create_schema(conexion: &mut Conexion, what: bool) -> Result<()> {
     if what {
         diesel::sql_query(
             "CREATE TABLE IF NOT EXISTS Recovery (
-                status BOOL DEFAULT FALSE,
+                status BOOL PRIMARY KEY DEFAULT FALSE,
                 hash TEXT NOT NULL,
                 salt TEXT NOT NULL
             );
@@ -166,12 +149,37 @@ fn create_schema(conexion: &mut Conexion, what: bool) -> Result<()> {
     Ok(())
 }
 
-fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
-    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
-        .execute(&mut conexion.pool)?;
+fn status(conexion: &mut Conexion) -> Result<bool> {
+    if diesel::select(exists(
+        recovery_dsl::recovery.filter(recovery_dsl::status.eq(true)),
+    ))
+    .get_result::<bool>(&mut conexion.pool)?
+    {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
 
-    if rows == 0 {
-        bail!("No record found with name: {}", name);
+fn update_status(conexion: &mut Conexion) -> Result<()> {
+    diesel::sql_query("UPDATE Recovery SET status = TRUE").execute(&mut conexion.pool)?;
+    Ok(())
+}
+
+fn clear_console() {
+    print!("\x1B[2J\x1B[1;1H");
+}
+
+fn check_name(nombre: &str) -> Result<()> {
+    if nombre.len() > 9 {
+        bail!(
+            "El nombre {}... excede el limite de caracteres permitidos",
+            &nombre[0..9]
+        );
+    }
+
+    if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        bail!("El nombre solo puede contener letras, numeros y guiones bajos");
     }
 
     Ok(())
@@ -180,7 +188,6 @@ fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
 fn encrypt(data: &[u8], master: &String) -> Result<Vec<u8>> {
     let mut encryptor = AesEncryptor::new_256_from_password(master.as_bytes(), Mode::CBC)?;
     encryptor.update(data)?;
-
     Ok(encryptor.finalize()?)
 }
 
@@ -298,47 +305,45 @@ fn import_all(conexion: &mut Conexion, master: &String) -> Result<()> {
     Ok(())
 }
 
-fn status(conexion: &mut Conexion) -> Result<bool> {
-    if diesel::select(exists(
-        recovery_dsl::recovery.filter(recovery_dsl::status.eq(true)),
-    ))
-    .get_result::<bool>(&mut conexion.pool)?
-    {
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
+fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
+    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
+        .execute(&mut conexion.pool)?;
 
-fn update_status(conexion: &mut Conexion) -> Result<()> {
-    if diesel::update(recovery_dsl::recovery)
-        .set(recovery_dsl::status.eq(true))
-        .execute(&mut conexion.pool).is_ok()
-    {
-        Ok(())
-    } else {
-        bail!("Updating status");
+    if rows == 0 {
+        bail!("No record found with name: {}", name);
     }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
-    clear_console();
     dotenvy::dotenv()?;
 
     let master_string = env::var("PWD")?;
     let mut conexion = Conexion::new()?;
 
     create_schema(&mut conexion, true)?;
+
     let status_ = status(&mut conexion)?;
+    let e = Password::default();
 
     if !status_ {
-        create_1_instance(&mut conexion)?;
+        e.create_instance(&mut conexion)?;
     } else {
-        let hash_new = create_2_instance(&mut conexion)?;
-        let salt_hash_db = get_salt_hash_from_db(&mut conexion)?;
+        let salt_str = Password::get_salt_from_db(&mut conexion)?;
+
+        let hash_new = {
+            let mut new_hash = [0u8; 32];
+            Argon2::default()
+                .hash_password_into(e.s_master.as_bytes(), salt_str.as_bytes(), &mut new_hash)
+                .unwrap();
+            BASE64_URL_SAFE.encode(new_hash)
+        };
+
+        let salt_hash_db = Password::get_salt_hash_from_db(&mut conexion)?;
 
         if let Some((_, hash_db)) = salt_hash_db {
-            verify_hash(&hash_new, &hash_db)?;
+            Password::verify_hash(&hash_new, &hash_db)?;
         } else {
             bail!("No password hash found in db");
         }
@@ -377,7 +382,7 @@ fn main() -> Result<()> {
                 add(
                     &mut conexion,
                     &Almacen {
-                        id: 0, // Diesel
+                        id: 0,
                         nombre: name.to_string(),
                         key: BASE64_URL_SAFE.encode(&encrypted),
                     },

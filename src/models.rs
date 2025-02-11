@@ -5,20 +5,11 @@ use diesel::prelude::*;
 #[derive(Queryable)]
 #[diesel(table_name = almacen)]
 pub struct Almacen {
+    #[warn(dead_code)]
     pub id: i32,
     pub nombre: String,
     pub key: String,
 }
-
-/*
-#[derive(Queryable)]
-#[diesel(table_name = recovery)]
-pub struct Recovery {
-    pub salt: String,
-    pub hash: String,
-    pub status: bool,
-}
-*/
 
 #[derive(Insertable)]
 #[diesel(table_name = almacen)]
@@ -27,14 +18,14 @@ pub struct Registro<'a> {
     pub key: &'a str,
 }
 
-#[derive(Insertable, Selectable)]
+#[derive(Insertable)]
 #[diesel(table_name = recovery)]
 pub struct RegistroRecovery<'a> {
     pub salt: &'a str,
     pub hash: &'a str,
 }
 
-#[derive(Insertable, Selectable)]
+#[derive(Insertable)]
 #[diesel(table_name = recovery)]
 pub struct StatusRecovery<'a> {
     pub status: &'a bool,
