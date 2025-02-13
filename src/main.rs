@@ -67,45 +67,35 @@ impl Password {
         }
     }
 
-    fn create_instance(&self, conexion: &mut Conexion) -> Result<()> {
+    fn create_instance(&self, salt: String) -> Result<String> {
         let mut new_hash = [0u8; 32];
-
         Argon2::default()
             .hash_password_into(
                 self.s_master.as_bytes(),
-                self.s_salt.to_string().as_bytes(),
+                salt.to_string().as_bytes(),
                 &mut new_hash,
             )
             .unwrap();
+        Ok(BASE64_URL_SAFE.encode(new_hash))
+    }
+
+    fn new_instance(&self, salt: String, conexion: &mut Conexion) -> Result<()> {
+        let new_hash = self.create_instance(salt)?;
 
         diesel::insert_into(recovery_dsl::recovery)
             .values(RegistroRecovery {
                 salt: self.s_salt.as_str(),
-                hash: &BASE64_URL_SAFE.encode(new_hash),
+                hash: &new_hash,
             })
             .execute(&mut conexion.pool)?;
 
         Ok(())
     }
 
-    fn get_salt_from_db(conexion: &mut Conexion) -> Result<String> {
-        let result = recovery_dsl::recovery
-            .select(recovery_dsl::salt)
-            .limit(1)
-            .load::<String>(&mut conexion.pool)?;
-
-        if let Some(salt) = result.into_iter().next() {
-            Ok(salt)
-        } else {
-            bail!("No salt found in database")
-        }
-    }
-
-    fn get_salt_hash_from_db(conexion: &mut Conexion) -> Result<Option<(String, String)>> {
+    fn get_salt_hash_from_db(conexion: &mut Conexion) -> Result<(String, String)> {
         let result = recovery_dsl::recovery
             .select((recovery_dsl::salt, recovery_dsl::hash))
-            .first::<(String, String)>(&mut conexion.pool)
-            .optional()?;
+            .first::<(String, String)>(&mut conexion.pool).unwrap();
         Ok(result)
     }
 
@@ -159,11 +149,6 @@ fn status(conexion: &mut Conexion) -> Result<bool> {
     } else {
         Ok(false)
     }
-}
-
-fn update_status(conexion: &mut Conexion) -> Result<()> {
-    diesel::sql_query("UPDATE Recovery SET status = TRUE").execute(&mut conexion.pool)?;
-    Ok(())
 }
 
 fn clear_console() {
@@ -310,13 +295,14 @@ fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
         .execute(&mut conexion.pool)?;
 
     if rows == 0 {
-        bail!("No record found with name: {}", name);
+        bail!("No record found with name {}", name);
     }
 
     Ok(())
 }
 
 fn main() -> Result<()> {
+    clear_console();
     dotenvy::dotenv()?;
 
     let master_string = env::var("PWD")?;
@@ -328,28 +314,13 @@ fn main() -> Result<()> {
     let e = Password::default();
 
     if !status_ {
-        e.create_instance(&mut conexion)?;
+        e.new_instance(e.s_salt.to_string(), &mut conexion)?;
+        diesel::sql_query("UPDATE Recovery SET status = TRUE").execute(&mut conexion.pool)?;
     } else {
-        let salt_str = Password::get_salt_from_db(&mut conexion)?;
-
-        let hash_new = {
-            let mut new_hash = [0u8; 32];
-            Argon2::default()
-                .hash_password_into(e.s_master.as_bytes(), salt_str.as_bytes(), &mut new_hash)
-                .unwrap();
-            BASE64_URL_SAFE.encode(new_hash)
-        };
-
-        let salt_hash_db = Password::get_salt_hash_from_db(&mut conexion)?;
-
-        if let Some((_, hash_db)) = salt_hash_db {
-            Password::verify_hash(&hash_new, &hash_db)?;
-        } else {
-            bail!("No password hash found in db");
-        }
+        let (salt_db, hash_db) = Password::get_salt_hash_from_db(&mut conexion)?;
+        let new_hash = e.create_instance(salt_db)?;
+        Password::verify_hash(&new_hash, &hash_db)?;
     }
-
-    update_status(&mut conexion)?;
 
     loop {
         println!(
