@@ -1,31 +1,38 @@
-use crate::models::{Almacen, Registro, RegistroRecovery};
+use crate::models::{Almacen, NewData, NewRecovery, NewRegistro};
 use crate::schema::almacen::dsl as almacen_dsl;
+use crate::schema::almacen_data::dsl as almacen_data_dsl;
 use crate::schema::recovery::dsl as recovery_dsl;
-use anyhow::{bail, Ok, Result};
-use argon2::password_hash::{rand_core::OsRng, SaltString};
-use argon2::Argon2;
+use anyhow::{anyhow, bail, Ok, Result};
+use argon2::{password_hash::SaltString, Argon2};
 use base64::prelude::*;
 use colored::Colorize;
 use comfy_table::{
     modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
     Table,
 };
-use cryptojs_rust::{
-    aes::{AesDecryptor, AesEncryptor},
-    CryptoOperation, Mode,
-};
 use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
 use inquire::Text;
+use ring::{
+    aead::{
+        Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, AES_256_GCM,
+        NONCE_LEN,
+    },
+    error::Unspecified,
+    rand::{SecureRandom, SystemRandom},
+};
 use std::{
     env,
     fs::{self, File},
     path::Path,
 };
+use zeroize::Zeroize;
 
 mod models;
 mod schema;
 
-struct Password {
+struct SingleNonce([u8; NONCE_LEN]);
+
+struct Data {
     s_master: String,
     s_salt: SaltString,
 }
@@ -39,6 +46,18 @@ const DB_PATH: &str = "./db";
 const FILE_EXPORT: &str = "./files/exportar_datos.csv";
 const FILE_IMPORT: &str = "./files/importar_datos.csv";
 
+impl NonceSequence for SingleNonce {
+    fn advance(&mut self) -> Result<Nonce, Unspecified> {
+        Nonce::try_assume_unique_for_key(&self.0)
+    }
+}
+
+impl Drop for Data {
+    fn drop(&mut self) {
+        self.s_master.zeroize();
+    }
+}
+
 impl Conexion {
     fn new() -> Result<Self> {
         if !Path::new(DB_PATH).exists() {
@@ -51,15 +70,19 @@ impl Conexion {
     }
 }
 
-impl Default for Password {
+impl Default for Data {
     fn default() -> Self {
+        let rand = SystemRandom::new();
         let master = env::var("PWD").unwrap();
-        let salt_ = SaltString::generate(&mut OsRng);
-        Self::new(master, salt_)
+
+        let mut salt_value = [0; 32];
+        rand.fill(&mut salt_value).unwrap();
+
+        Self::new(master, SaltString::encode_b64(&salt_value).unwrap())
     }
 }
 
-impl Password {
+impl Data {
     fn new(_master: String, salt_: SaltString) -> Self {
         Self {
             s_master: _master,
@@ -67,7 +90,7 @@ impl Password {
         }
     }
 
-    fn create_instance(&self, salt: String) -> Result<String> {
+    fn new_hash(&self, salt: String) -> Result<String> {
         let mut new_hash = [0u8; 32];
         Argon2::default()
             .hash_password_into(
@@ -75,15 +98,15 @@ impl Password {
                 salt.to_string().as_bytes(),
                 &mut new_hash,
             )
-            .unwrap();
+            .map_err(|err| anyhow!("Error hashing: {}", err))?;
         Ok(BASE64_URL_SAFE.encode(new_hash))
     }
 
     fn new_instance(&self, salt: String, conexion: &mut Conexion) -> Result<()> {
-        let new_hash = self.create_instance(salt)?;
+        let new_hash = self.new_hash(salt)?;
 
         diesel::insert_into(recovery_dsl::recovery)
-            .values(RegistroRecovery {
+            .values(NewRecovery {
                 salt: self.s_salt.as_str(),
                 hash: &new_hash,
             })
@@ -95,7 +118,8 @@ impl Password {
     fn get_salt_hash_from_db(conexion: &mut Conexion) -> Result<(String, String)> {
         let result = recovery_dsl::recovery
             .select((recovery_dsl::salt, recovery_dsl::hash))
-            .first::<(String, String)>(&mut conexion.pool).unwrap();
+            .first::<(String, String)>(&mut conexion.pool)
+            .map_err(|err| anyhow!("Error obtaining salt_hash from db: {}", err))?;
         Ok(result)
     }
 
@@ -111,8 +135,8 @@ impl Password {
     }
 }
 
-fn create_schema(conexion: &mut Conexion, what: bool) -> Result<()> {
-    if what {
+fn create_schema(conexion: &mut Conexion, init: bool) -> Result<()> {
+    if init {
         diesel::sql_query(
             "CREATE TABLE IF NOT EXISTS Recovery (
                 status BOOL PRIMARY KEY DEFAULT FALSE,
@@ -123,18 +147,29 @@ fn create_schema(conexion: &mut Conexion, what: bool) -> Result<()> {
         )
         .execute(&mut conexion.pool)?;
     } else {
-        diesel::sql_query(
-            "CREATE TABLE IF NOT EXISTS Almacen (
+        let data = "
+            CREATE TABLE IF NOT EXISTS Almacen (
                 id INTEGER PRIMARY KEY,
                 nombre TEXT NOT NULL,
                 key TEXT NOT NULL
             );
+            
+            CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
+            CREATE INDEX IF NOT EXISTS id_key ON Almacen(key);
+        ";
 
-        CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
-        CREATE INDEX IF NOT EXISTS id_key ON Almacen(key);
-        ",
-        )
-        .execute(&mut conexion.pool)?;
+        let data2 = "
+            CREATE TABLE IF NOT EXISTS Almacen_Data (
+                id INTEGER PRIMARY KEY,
+                key TEXT NOT NULL,
+                nonce TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS id_key ON AlmacenData(id);
+        ";
+
+        diesel::sql_query(data).execute(&mut conexion.pool)?;
+        diesel::sql_query(data2).execute(&mut conexion.pool)?;
     }
     Ok(())
 }
@@ -170,25 +205,62 @@ fn check_name(nombre: &str) -> Result<()> {
     Ok(())
 }
 
-fn encrypt(data: &[u8], master: &String) -> Result<Vec<u8>> {
-    let mut encryptor = AesEncryptor::new_256_from_password(master.as_bytes(), Mode::CBC)?;
-    encryptor.update(data)?;
-    Ok(encryptor.finalize()?)
+fn crypt(conexion: &mut Conexion, associated_data: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let rand = SystemRandom::new();
+    let mut key_bytes = vec![0; AES_256_GCM.key_len()];
+
+    rand.fill(&mut key_bytes).expect("msg1");
+    let mut nonce_value = [0; NONCE_LEN];
+    rand.fill(&mut nonce_value).expect("msg2");
+
+    let unbound_key = UnboundKey::new(&AES_256_GCM, &key_bytes).expect("err1");
+    let nonce_sequence = SingleNonce(nonce_value);
+    let mut sealing_key = SealingKey::new(unbound_key, nonce_sequence);
+
+    let mut in_out = data.to_vec();
+    let tag = sealing_key
+        .seal_in_place_separate_tag(Aad::from(associated_data), &mut in_out)
+        .expect("err2");
+
+    insert_record(&key_bytes, &nonce_value, conexion).expect("err3");
+
+    Ok([in_out, tag.as_ref().to_vec()].concat())
 }
 
-fn decrypt(data: Vec<u8>, master: &String) -> Result<Vec<u8>> {
-    let _salt = &data[..16];
-    let iv = &data[16..32];
-    let ciphertext = &data[32..];
+fn decrypt(
+    key_bytes: &[u8],
+    nonce_value: &[u8],
+    associated_data: &[u8],
+    cypher_text_with_tag: &[u8],
+) -> Result<Vec<u8>> {
+    let unbound_key = UnboundKey::new(&AES_256_GCM, key_bytes).expect("err1");
+    let nonce_sequence = SingleNonce(nonce_value.try_into()?);
+    let mut opening_key = OpeningKey::new(unbound_key, nonce_sequence);
 
-    let mut decryptor =
-        AesDecryptor::new_256_from_password(master.as_bytes(), Mode::CBC, _salt, Some(iv))?;
+    let mut in_out = cypher_text_with_tag.to_vec();
+    let decrypted_data = opening_key
+        .open_in_place(Aad::from(associated_data), &mut in_out)
+        .expect("err2");
 
-    decryptor.update(ciphertext)?;
-    Ok(decryptor.finalize()?)
+    Ok(decrypted_data.to_vec())
+}
+
+fn decrypt_this(nombre: &String, hash: String, conexion: &mut Conexion) -> Result<Vec<u8>> {
+    let (key_almacen, id) = get_key_id_almacen_from_db(conexion, nombre).expect("ee1");
+    let (key, nonce) = get_key_nonce_almacendata_from_db(conexion, id).expect("ee2");
+
+    let decode_key = BASE64_URL_SAFE.decode(&key_almacen)?.to_vec();
+    let key_decoded = BASE64_URL_SAFE.decode(&key).expect("ee3");
+    let nonce_decoded = BASE64_URL_SAFE.decode(&nonce).expect("ee4");
+
+    let decrypted_data = decrypt(&key_decoded, &nonce_decoded, hash.as_bytes(), &decode_key)?;
+
+    Ok(decrypted_data)
 }
 
 fn add(conexion: &mut Conexion, data: &Almacen) -> Result<()> {
+    check_name(&data.nombre)?;
+
     if diesel::select(exists(
         almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&data.nombre)),
     ))
@@ -197,17 +269,31 @@ fn add(conexion: &mut Conexion, data: &Almacen) -> Result<()> {
         bail!("Name {} already exist", &data.nombre);
     }
 
+    let (_, hash_db) = Data::get_salt_hash_from_db(conexion)?;
+    let wrapped = crypt(conexion, hash_db.as_bytes(), data.key.as_bytes())?;
+
     diesel::insert_into(almacen_dsl::almacen)
-        .values(Registro {
+        .values(NewRegistro {
             nombre: &data.nombre,
-            key: &data.key,
+            key: &BASE64_URL_SAFE.encode(&wrapped),
         })
         .execute(&mut conexion.pool)?;
 
     Ok(())
 }
 
-fn view_all(conexion: &mut Conexion, master: &String, inicio: &u16, fin: &u16) -> Result<()> {
+fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
+    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
+        .execute(&mut conexion.pool)?;
+
+    if rows == 0 {
+        bail!("No record found with name {}", name);
+    }
+
+    Ok(())
+}
+
+fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
     let results = almacen_dsl::almacen
         .limit((fin - inicio) as i64)
         .offset(*inicio as i64)
@@ -225,15 +311,18 @@ fn view_all(conexion: &mut Conexion, master: &String, inicio: &u16, fin: &u16) -
         .apply_modifier(UTF8_ROUND_CORNERS);
 
     tabla.set_header(vec![
+        Cell::new("ID"),
         Cell::new("Nombre"),
         Cell::new("Key").set_alignment(CellAlignment::Center),
     ]);
 
+    let (_, hash_db) = Data::get_salt_hash_from_db(conexion)?;
+
     for row in results {
-        let decoded = BASE64_URL_SAFE.decode(&row.key)?;
-        let decrypted = decrypt(decoded, master)?;
+        let decrypted = decrypt_this(&row.nombre, hash_db.clone(), conexion)?;
 
         tabla.add_row(cRow::from(vec![
+            Cell::new(row.id),
             Cell::new(row.nombre),
             Cell::new(String::from_utf8(decrypted)?),
         ]));
@@ -247,14 +336,15 @@ fn view_all(conexion: &mut Conexion, master: &String, inicio: &u16, fin: &u16) -
     Ok(())
 }
 
-fn export_all(conexion: &mut Conexion, master: &String) -> Result<()> {
+fn export_all(conexion: &mut Conexion) -> Result<()> {
     let results = almacen_dsl::almacen.load::<Almacen>(&mut conexion.pool)?;
 
     let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
 
+    let (_, hash_db) = Data::get_salt_hash_from_db(conexion)?;
+
     for row in results {
-        let decoded = BASE64_URL_SAFE.decode(&row.key)?;
-        let decrypted = decrypt(decoded, master)?;
+        let decrypted = decrypt_this(&row.nombre, hash_db.clone(), conexion)?;
         let result = String::from_utf8(decrypted)?;
         writer.write_record(&[row.nombre, result])?;
     }
@@ -262,7 +352,7 @@ fn export_all(conexion: &mut Conexion, master: &String) -> Result<()> {
     Ok(())
 }
 
-fn import_all(conexion: &mut Conexion, master: &String) -> Result<()> {
+fn import_all(conexion: &mut Conexion) -> Result<()> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_path(FILE_IMPORT)?;
@@ -276,12 +366,10 @@ fn import_all(conexion: &mut Conexion, master: &String) -> Result<()> {
             bail!("empty key for name: {}", &record[0]);
         }
 
-        let encrypted = encrypt(record[1].as_bytes(), master)?;
-
         let _almacen = Almacen {
             id: 0,
             nombre: record[0].to_string(),
-            key: BASE64_URL_SAFE.encode(&encrypted),
+            key: record[1].to_string(),
         };
 
         add(conexion, &_almacen)?;
@@ -290,37 +378,58 @@ fn import_all(conexion: &mut Conexion, master: &String) -> Result<()> {
     Ok(())
 }
 
-fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
-    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
+fn insert_record(key_bytes: &[u8], nonce_value: &[u8], conexion: &mut Conexion) -> Result<()> {
+    diesel::insert_into(almacen_data_dsl::almacen_data)
+        .values(NewData {
+            key: &BASE64_URL_SAFE.encode(key_bytes),
+            nonce: &BASE64_URL_SAFE.encode(nonce_value),
+        })
         .execute(&mut conexion.pool)?;
-
-    if rows == 0 {
-        bail!("No record found with name {}", name);
-    }
-
     Ok(())
+}
+
+fn get_key_id_almacen_from_db(conexion: &mut Conexion, nombre: &String) -> Result<(String, u16)> {
+    let result = almacen_dsl::almacen
+        .filter(almacen_dsl::nombre.eq(nombre))
+        .select((almacen_dsl::id, almacen_dsl::key))
+        .first::<(i32, String)>(&mut conexion.pool)?;
+
+    let (id, key) = result;
+
+    Ok((key, id as u16))
+}
+
+fn get_key_nonce_almacendata_from_db(conexion: &mut Conexion, id: u16) -> Result<(String, String)> {
+    let result = almacen_data_dsl::almacen_data
+        .filter(almacen_data_dsl::id.eq(id as i32))
+        .select((almacen_data_dsl::key, almacen_data_dsl::nonce))
+        .first::<(String, String)>(&mut conexion.pool)?;
+
+    Ok(result)
 }
 
 fn main() -> Result<()> {
     clear_console();
     dotenvy::dotenv()?;
 
-    let master_string = env::var("PWD")?;
     let mut conexion = Conexion::new()?;
 
     create_schema(&mut conexion, true)?;
 
-    let status_ = status(&mut conexion)?;
-    let e = Password::default();
+    let status_ = status(&mut conexion)?; // mejor escribirlo en un archivo?
+    let data = Data::default();
 
     if !status_ {
-        e.new_instance(e.s_salt.to_string(), &mut conexion)?;
+        data.new_instance(data.s_salt.to_string(), &mut conexion)?;
         diesel::sql_query("UPDATE Recovery SET status = TRUE").execute(&mut conexion.pool)?;
     } else {
-        let (salt_db, hash_db) = Password::get_salt_hash_from_db(&mut conexion)?;
-        let new_hash = e.create_instance(salt_db)?;
-        Password::verify_hash(&new_hash, &hash_db)?;
+        let (salt_db, hash_db) = Data::get_salt_hash_from_db(&mut conexion)?;
+        let new_hash = data.new_hash(salt_db)?;
+        Data::verify_hash(&new_hash, &hash_db)?;
     }
+
+    let colored = "\x1b[32m->\x1b[0m".to_string();
+    let mut is_new: bool = !status_;
 
     loop {
         println!(
@@ -338,26 +447,30 @@ fn main() -> Result<()> {
 
         println!(" ");
 
-        let entrada = Text::new("\x1b[32m->\x1b[0m").prompt()?;
+        let entrada: String = if is_new {
+            Text::new(&colored).with_default("First Time: s").prompt()?
+        } else {
+            Text::new(&colored).prompt()?
+        };
+
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
             ["s"] => {
                 create_schema(&mut conexion, false)?;
+                is_new = false;
                 clear_console();
             }
             ["a", name, privkey] => {
-                check_name(name)?;
-                let encrypted = encrypt(privkey.as_bytes(), &master_string)?;
-
                 add(
                     &mut conexion,
                     &Almacen {
                         id: 0,
                         nombre: name.to_string(),
-                        key: BASE64_URL_SAFE.encode(&encrypted),
+                        key: privkey.to_string(),
                     },
                 )?;
+
                 clear_console();
             }
             ["v", inicio, fin] => {
@@ -365,15 +478,15 @@ fn main() -> Result<()> {
                 println!(" ");
                 let pg_inicio = inicio.parse::<u16>()?;
                 let pg_fin = fin.parse::<u16>()?;
-                view_all(&mut conexion, &master_string, &pg_inicio, &pg_fin)?;
+                view_all(&mut conexion, &pg_inicio, &pg_fin)?;
                 println!(" ");
             }
             ["e"] => {
-                export_all(&mut conexion, &master_string)?;
+                export_all(&mut conexion)?;
                 clear_console();
             }
             ["i"] => {
-                import_all(&mut conexion, &master_string)?;
+                import_all(&mut conexion)?;
                 clear_console();
             }
             ["r", _nombre] => {

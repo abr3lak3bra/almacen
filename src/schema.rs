@@ -9,6 +9,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    almacen_data (id) {
+        id -> Integer,
+        key -> Text,
+        nonce -> Text,
+    }
+}
+
+diesel::table! {
     recovery (status) {
         status -> Bool,
         hash -> Text,
