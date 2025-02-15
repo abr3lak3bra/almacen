@@ -14,8 +14,8 @@ use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
 use inquire::{Password, Text};
 use ring::{
     aead::{
-        Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, AES_256_GCM,
-        NONCE_LEN,
+        quic::CHACHA20, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
+        CHACHA20_POLY1305, NONCE_LEN,
     },
     error::Unspecified,
     rand::{SecureRandom, SystemRandom},
@@ -222,13 +222,13 @@ fn status(conexion: &mut Conexion) -> Result<bool> {
 
 fn crypt(conexion: &mut Conexion, associated_data: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let rand = SystemRandom::new();
-    let mut key_bytes = vec![0; AES_256_GCM.key_len()];
+    let mut key_bytes = vec![0; CHACHA20.key_len()];
 
     rand.fill(&mut key_bytes).expect("msg1");
     let mut nonce_value = [0; NONCE_LEN];
     rand.fill(&mut nonce_value).expect("msg2");
 
-    let unbound_key = UnboundKey::new(&AES_256_GCM, &key_bytes).expect("err1");
+    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).expect("err1");
     let nonce_sequence = SingleNonce(nonce_value);
     let mut sealing_key = SealingKey::new(unbound_key, nonce_sequence);
 
@@ -248,7 +248,7 @@ fn decrypt(
     associated_data: &[u8],
     cypher_text_with_tag: &[u8],
 ) -> Result<Vec<u8>> {
-    let unbound_key = UnboundKey::new(&AES_256_GCM, key_bytes).expect("err1");
+    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key_bytes).expect("err1");
     let nonce_sequence = SingleNonce(nonce_value.try_into()?);
     let mut opening_key = OpeningKey::new(unbound_key, nonce_sequence);
 
@@ -424,8 +424,6 @@ fn get_key_nonce_almacendata_from_db(conexion: &mut Conexion, id: u16) -> Result
 }
 
 fn main() -> Result<()> {
-    clear_console();
-
     let mut conexion = Conexion::new()?;
 
     create_schema(&mut conexion, true)?;
@@ -442,6 +440,8 @@ fn main() -> Result<()> {
         let new_hash = data.new_hash(&salt_db)?;
         Data::verify_hash(&new_hash, &hash_db)?;
     }
+
+    clear_console();
 
     let mut is_new: bool = !status_;
 
@@ -462,7 +462,6 @@ fn main() -> Result<()> {
         println!(" ");
 
         let entrada: String = if is_new { prompts(3)? } else { prompts(4)? };
-
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
