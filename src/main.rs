@@ -11,7 +11,7 @@ use comfy_table::{
     Table,
 };
 use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
-use inquire::Text;
+use inquire::{Password, Text};
 use ring::{
     aead::{
         Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, AES_256_GCM,
@@ -21,7 +21,6 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use std::{
-    env,
     fs::{self, File},
     path::Path,
 };
@@ -33,8 +32,7 @@ mod schema;
 struct SingleNonce([u8; NONCE_LEN]);
 
 struct Data {
-    s_master: String,
-    s_salt: SaltString,
+    master: String,
 }
 
 struct Conexion {
@@ -54,7 +52,7 @@ impl NonceSequence for SingleNonce {
 
 impl Drop for Data {
     fn drop(&mut self) {
-        self.s_master.zeroize();
+        self.master.zeroize();
     }
 }
 
@@ -70,31 +68,24 @@ impl Conexion {
     }
 }
 
-impl Default for Data {
-    fn default() -> Self {
-        let rand = SystemRandom::new();
-        let master = env::var("PWD").unwrap();
-
-        let mut salt_value = [0; 32];
-        rand.fill(&mut salt_value).unwrap();
-
-        Self::new(master, SaltString::encode_b64(&salt_value).unwrap())
-    }
-}
-
 impl Data {
-    fn new(_master: String, salt_: SaltString) -> Self {
-        Self {
-            s_master: _master,
-            s_salt: salt_,
-        }
+    fn new(status: bool) -> Result<Self> {
+        let _master = {
+            if status {
+                prompts(1)?
+            } else {
+                prompts(2)?
+            }
+        };
+
+        Ok(Self { master: _master })
     }
 
-    fn new_hash(&self, salt: String) -> Result<String> {
+    fn new_hash(&self, salt: &String) -> Result<String> {
         let mut new_hash = [0u8; 32];
         Argon2::default()
             .hash_password_into(
-                self.s_master.as_bytes(),
+                self.master.as_bytes(),
                 salt.to_string().as_bytes(),
                 &mut new_hash,
             )
@@ -102,12 +93,18 @@ impl Data {
         Ok(BASE64_URL_SAFE.encode(new_hash))
     }
 
-    fn new_instance(&self, salt: String, conexion: &mut Conexion) -> Result<()> {
-        let new_hash = self.new_hash(salt)?;
+    fn new_instance(&self, conexion: &mut Conexion) -> Result<()> {
+        let rand = SystemRandom::new();
+
+        let mut salt = [0; 32];
+        rand.fill(&mut salt).unwrap();
+
+        let new_salt = SaltString::encode_b64(&salt).unwrap();
+        let new_hash = self.new_hash(&new_salt.to_string())?;
 
         diesel::insert_into(recovery_dsl::recovery)
             .values(NewRecovery {
-                salt: self.s_salt.as_str(),
+                salt: new_salt.clone().as_str(),
                 hash: &new_hash,
             })
             .execute(&mut conexion.pool)?;
@@ -132,6 +129,43 @@ impl Data {
         }
 
         Ok(())
+    }
+}
+
+fn clear_console() {
+    print!("\x1B[2J\x1B[1;1H");
+}
+
+fn check_name(nombre: &str) -> Result<()> {
+    if nombre.len() > 9 {
+        bail!(
+            "El nombre {}... excede el limite de caracteres permitidos",
+            &nombre[0..9]
+        );
+    }
+
+    if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        bail!("El nombre solo puede contener letras, numeros y guiones bajos");
+    }
+
+    Ok(())
+}
+
+fn prompts(n: u8) -> Result<String> {
+    let colored = "\x1b[32m->\x1b[0m".to_string();
+
+    if n == 1 {
+        Ok(Password::new("Enter Password")
+            .without_confirmation()
+            .prompt()?)
+    } else if n == 2 {
+        Ok(Password::new("Enter new Password").prompt()?)
+    } else if n == 3 {
+        Ok(Text::new(&colored).with_default("First Time: s").prompt()?)
+    } else if n == 4 {
+        Ok(Text::new(&colored).prompt()?)
+    } else {
+        bail!("Wrong option");
     }
 }
 
@@ -184,25 +218,6 @@ fn status(conexion: &mut Conexion) -> Result<bool> {
     } else {
         Ok(false)
     }
-}
-
-fn clear_console() {
-    print!("\x1B[2J\x1B[1;1H");
-}
-
-fn check_name(nombre: &str) -> Result<()> {
-    if nombre.len() > 9 {
-        bail!(
-            "El nombre {}... excede el limite de caracteres permitidos",
-            &nombre[0..9]
-        );
-    }
-
-    if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        bail!("El nombre solo puede contener letras, numeros y guiones bajos");
-    }
-
-    Ok(())
 }
 
 fn crypt(conexion: &mut Conexion, associated_data: &[u8], data: &[u8]) -> Result<Vec<u8>> {
@@ -410,25 +425,24 @@ fn get_key_nonce_almacendata_from_db(conexion: &mut Conexion, id: u16) -> Result
 
 fn main() -> Result<()> {
     clear_console();
-    dotenvy::dotenv()?;
 
     let mut conexion = Conexion::new()?;
 
     create_schema(&mut conexion, true)?;
 
-    let status_ = status(&mut conexion)?; // mejor escribirlo en un archivo?
-    let data = Data::default();
+    let status_ = status(&mut conexion)?;
+
+    let data = Data::new(status_)?;
 
     if !status_ {
-        data.new_instance(data.s_salt.to_string(), &mut conexion)?;
+        data.new_instance(&mut conexion)?;
         diesel::sql_query("UPDATE Recovery SET status = TRUE").execute(&mut conexion.pool)?;
     } else {
         let (salt_db, hash_db) = Data::get_salt_hash_from_db(&mut conexion)?;
-        let new_hash = data.new_hash(salt_db)?;
+        let new_hash = data.new_hash(&salt_db)?;
         Data::verify_hash(&new_hash, &hash_db)?;
     }
 
-    let colored = "\x1b[32m->\x1b[0m".to_string();
     let mut is_new: bool = !status_;
 
     loop {
@@ -447,11 +461,7 @@ fn main() -> Result<()> {
 
         println!(" ");
 
-        let entrada: String = if is_new {
-            Text::new(&colored).with_default("First Time: s").prompt()?
-        } else {
-            Text::new(&colored).prompt()?
-        };
+        let entrada: String = if is_new { prompts(3)? } else { prompts(4)? };
 
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
