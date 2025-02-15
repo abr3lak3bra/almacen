@@ -39,6 +39,13 @@ struct Conexion {
     pool: SqliteConnection,
 }
 
+enum Prompts {
+    First,
+    Second,
+    Third,
+    Fourth,
+}
+
 const DB: &str = "./db/db.db";
 const DB_PATH: &str = "./db";
 const FILE_EXPORT: &str = "./files/exportar_datos.csv";
@@ -50,8 +57,8 @@ impl NonceSequence for SingleNonce {
     }
 }
 
-impl Drop for Data {
-    fn drop(&mut self) {
+impl Zeroize for Data {
+    fn zeroize(&mut self) {
         self.master.zeroize();
     }
 }
@@ -72,9 +79,9 @@ impl Data {
     fn new(status: bool) -> Result<Self> {
         let _master = {
             if status {
-                prompts(1)?
+                prompts(Prompts::First)?
             } else {
-                prompts(2)?
+                prompts(Prompts::Second)?
             }
         };
 
@@ -151,21 +158,14 @@ fn check_name(nombre: &str) -> Result<()> {
     Ok(())
 }
 
-fn prompts(n: u8) -> Result<String> {
-    let colored = "\x1b[32m->\x1b[0m".to_string();
+fn prompts(p: Prompts) -> Result<String> {
+    let colored = "\x1b[32m->\x1b[0m";
 
-    if n == 1 {
-        Ok(Password::new("Enter Password")
-            .without_confirmation()
-            .prompt()?)
-    } else if n == 2 {
-        Ok(Password::new("Enter new Password").prompt()?)
-    } else if n == 3 {
-        Ok(Text::new(&colored).with_default("First Time: s").prompt()?)
-    } else if n == 4 {
-        Ok(Text::new(&colored).prompt()?)
-    } else {
-        bail!("Wrong option");
+    match p {
+        Prompts::First => Ok(Password::new("Enter Password").without_confirmation().prompt()?),
+        Prompts::Second => Ok(Password::new("Enter new Password").prompt()?),
+        Prompts::Third => Ok(Text::new(colored).with_default("First s").prompt()?),
+        Prompts::Fourth => Ok(Text::new(colored).prompt()?),
     }
 }
 
@@ -430,7 +430,7 @@ fn main() -> Result<()> {
 
     let status_ = status(&mut conexion)?;
 
-    let data = Data::new(status_)?;
+    let mut data = Data::new(status_)?;
 
     if !status_ {
         data.new_instance(&mut conexion)?;
@@ -441,9 +441,10 @@ fn main() -> Result<()> {
         Data::verify_hash(&new_hash, &hash_db)?;
     }
 
-    clear_console();
+    data.zeroize();
+    let mut setup = false;
 
-    let mut is_new: bool = !status_;
+    clear_console();
 
     loop {
         println!(
@@ -461,13 +462,18 @@ fn main() -> Result<()> {
 
         println!(" ");
 
-        let entrada: String = if is_new { prompts(3)? } else { prompts(4)? };
+        let entrada: String = if !setup {
+            prompts(Prompts::Third)?
+        } else {
+            prompts(Prompts::Fourth)?
+        };
+
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
             ["s"] => {
                 create_schema(&mut conexion, false)?;
-                is_new = false;
+                setup = true;
                 clear_console();
             }
             ["a", name, privkey] => {
