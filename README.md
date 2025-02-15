@@ -1,8 +1,11 @@
 # Almacen - Interactive key store
 
 Argon2id for hash password.
+
 Ring with ChaCha20 for key.
+
 Keys are stored in db/db.db.
+
 Ring with ChaCha20 for the file db.db.
 
 ## Run
