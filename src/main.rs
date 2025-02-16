@@ -43,7 +43,6 @@ enum Prompts {
     First,
     Second,
     Third,
-    Fourth,
 }
 
 const DB: &str = "./db/db.db";
@@ -64,9 +63,9 @@ impl Zeroize for Data {
 }
 
 impl Conexion {
-    fn new() -> Result<Self> {
-        if !Path::new(DB_PATH).exists() {
-            fs::create_dir(DB_PATH)?;
+    fn new(status: bool) -> Result<Self> {
+        if status {
+             fs::create_dir(DB_PATH)?;
         }
 
         Ok(Self {
@@ -78,7 +77,7 @@ impl Conexion {
 impl Data {
     fn new(status: bool) -> Result<Self> {
         let _master = {
-            if status {
+            if !status {
                 prompts(Prompts::First)?
             } else {
                 prompts(Prompts::Second)?
@@ -164,8 +163,7 @@ fn prompts(p: Prompts) -> Result<String> {
     match p {
         Prompts::First => Ok(Password::new("Enter Password").without_confirmation().prompt()?),
         Prompts::Second => Ok(Password::new("Enter new Password").prompt()?),
-        Prompts::Third => Ok(Text::new(colored).with_default("First s").prompt()?),
-        Prompts::Fourth => Ok(Text::new(colored).prompt()?),
+        Prompts::Third => Ok(Text::new(colored).prompt()?),
     }
 }
 
@@ -173,8 +171,8 @@ fn create_schema(conexion: &mut Conexion, init: bool) -> Result<()> {
     if init {
         diesel::sql_query(
             "CREATE TABLE IF NOT EXISTS Recovery (
-                status BOOL PRIMARY KEY DEFAULT FALSE,
-                hash TEXT NOT NULL,
+                id INTEGER PRIMARY KEY, 
+                hash TEXT NOT NULL, 
                 salt TEXT NOT NULL
             );
         ",
@@ -206,18 +204,6 @@ fn create_schema(conexion: &mut Conexion, init: bool) -> Result<()> {
         diesel::sql_query(data2).execute(&mut conexion.pool)?;
     }
     Ok(())
-}
-
-fn status(conexion: &mut Conexion) -> Result<bool> {
-    if diesel::select(exists(
-        recovery_dsl::recovery.filter(recovery_dsl::status.eq(true)),
-    ))
-    .get_result::<bool>(&mut conexion.pool)?
-    {
-        Ok(true)
-    } else {
-        Ok(false)
-    }
 }
 
 fn crypt(conexion: &mut Conexion, associated_data: &[u8], data: &[u8]) -> Result<Vec<u8>> {
@@ -424,17 +410,17 @@ fn get_key_nonce_almacendata_from_db(conexion: &mut Conexion, id: u16) -> Result
 }
 
 fn main() -> Result<()> {
-    let mut conexion = Conexion::new()?;
-
-    create_schema(&mut conexion, true)?;
-
-    let status_ = status(&mut conexion)?;
+    let status_ = !Path::new(DB).exists();
 
     let mut data = Data::new(status_)?;
 
-    if !status_ {
+    let mut conexion = Conexion::new(status_)?;
+
+    create_schema(&mut conexion, true)?;
+
+    if status_ {
         data.new_instance(&mut conexion)?;
-        diesel::sql_query("UPDATE Recovery SET status = TRUE").execute(&mut conexion.pool)?;
+        create_schema(&mut conexion, false)?;
     } else {
         let (salt_db, hash_db) = Data::get_salt_hash_from_db(&mut conexion)?;
         let new_hash = data.new_hash(&salt_db)?;
@@ -442,14 +428,10 @@ fn main() -> Result<()> {
     }
 
     data.zeroize();
-    let mut setup = false;
-
-    clear_console();
 
     loop {
         println!(
-            "{}, {}, {}, {}, {}, {}, {} - abr{}lak{}bra",
-            "s".red(),
+            "{}, {}, {}, {}, {}, {} - abr{}lak{}bra",
             "a".green(),
             "v".cyan(),
             "i".purple(),
@@ -462,20 +444,11 @@ fn main() -> Result<()> {
 
         println!(" ");
 
-        let entrada: String = if !setup {
-            prompts(Prompts::Third)?
-        } else {
-            prompts(Prompts::Fourth)?
-        };
+        let entrada = prompts(Prompts::Third)?;
 
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
-            ["s"] => {
-                create_schema(&mut conexion, false)?;
-                setup = true;
-                clear_console();
-            }
             ["a", name, privkey] => {
                 add(
                     &mut conexion,

@@ -31,9 +31,3 @@ pub struct NewRecovery<'a> {
     pub salt: &'a str,
     pub hash: &'a str,
 }
-
-#[derive(Insertable)]
-#[diesel(table_name = recovery)]
-pub struct StatusRecovery<'a> {
-    pub status: &'a bool,
-}

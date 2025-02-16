@@ -1,6 +1,6 @@
 # Almacen - Interactive key store
 
-Argon2id for hash password.
+Argon2id for password hash.
 
 Ring with ChaCha20 for key.
 
@@ -30,7 +30,6 @@ Run
 
 ## Menu Usage
 ```bash
-s -> Setup
 a -> Add -> Usage: a testi1 0xac....
 v -> View -> Usage: v 0 10 -> Display records from id 0 to 10
 i -> Import

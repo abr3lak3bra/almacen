@@ -17,8 +17,8 @@ diesel::table! {
 }
 
 diesel::table! {
-    recovery (status) {
-        status -> Bool,
+    recovery (id) {
+        id -> Integer,
         hash -> Text,
         salt -> Text,
     }
