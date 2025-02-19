@@ -1,145 +1,56 @@
-use crate::models::{Almacen, NewData, NewRecovery, NewRegistro};
-use crate::schema::almacen::dsl as almacen_dsl;
-use crate::schema::almacen_data::dsl as almacen_data_dsl;
-use crate::schema::recovery::dsl as recovery_dsl;
-use anyhow::{anyhow, bail, Ok, Result};
-use argon2::{password_hash::SaltString, Argon2};
-use base64::prelude::*;
+use anyhow::{bail, Ok, Result};
 use colored::Colorize;
 use comfy_table::{
     modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
     Table,
 };
 use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
-use inquire::{Password, Text};
+use inquire::Text;
 use ring::{
-    aead::{
-        quic::CHACHA20, Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
-        CHACHA20_POLY1305, NONCE_LEN,
-    },
-    error::Unspecified,
+    aead,
+    aead::{LessSafeKey, Nonce},
     rand::{SecureRandom, SystemRandom},
 };
+use std::os::windows::fs::OpenOptionsExt;
 use std::{
-    fs::{self, File},
+    fs,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
     path::Path,
 };
 use zeroize::Zeroize;
-
 mod models;
 mod schema;
+use crate::schema::almacen::dsl as almacen_dsl;
+use models::{Almacen, NewData};
 
-struct SingleNonce([u8; NONCE_LEN]);
-
-struct Data {
-    master: String,
-}
-
-struct Conexion {
-    pool: SqliteConnection,
-}
-
-enum Prompts {
-    First,
-    Second,
-    Third,
-}
-
-const DB: &str = "./db/db.db";
-const DB_PATH: &str = "./db";
+const DB: &str = "./private/almacen.db";
+const DB_PATH: &str = "./private";
+const KEY_PATH: &str = "./private/private_key.bin";
 const FILE_EXPORT: &str = "./files/exportar_datos.csv";
 const FILE_IMPORT: &str = "./files/importar_datos.csv";
 
-impl NonceSequence for SingleNonce {
-    fn advance(&mut self) -> Result<Nonce, Unspecified> {
-        Nonce::try_assume_unique_for_key(&self.0)
-    }
+#[derive(Zeroize)]
+struct SensitiveData {
+    key: Vec<u8>,
+    decrypted_data: Vec<u8>,
 }
 
-impl Zeroize for Data {
-    fn zeroize(&mut self) {
-        self.master.zeroize();
-    }
-}
-
-impl Conexion {
-    fn new(status: bool) -> Result<Self> {
-        if status {
-             fs::create_dir(DB_PATH)?;
-        }
-
-        Ok(Self {
-            pool: SqliteConnection::establish(DB)?,
-        })
-    }
-}
-
-impl Data {
-    fn new(status: bool) -> Result<Self> {
-        let _master = {
-            if !status {
-                prompts(Prompts::First)?
-            } else {
-                prompts(Prompts::Second)?
-            }
-        };
-
-        Ok(Self { master: _master })
-    }
-
-    fn new_hash(&self, salt: &String) -> Result<String> {
-        let mut new_hash = [0u8; 32];
-        Argon2::default()
-            .hash_password_into(
-                self.master.as_bytes(),
-                salt.to_string().as_bytes(),
-                &mut new_hash,
-            )
-            .map_err(|err| anyhow!("Error hashing: {}", err))?;
-        Ok(BASE64_URL_SAFE.encode(new_hash))
-    }
-
-    fn new_instance(&self, conexion: &mut Conexion) -> Result<()> {
-        let rand = SystemRandom::new();
-
-        let mut salt = [0; 32];
-        rand.fill(&mut salt).unwrap();
-
-        let new_salt = SaltString::encode_b64(&salt).unwrap();
-        let new_hash = self.new_hash(&new_salt.to_string())?;
-
-        diesel::insert_into(recovery_dsl::recovery)
-            .values(NewRecovery {
-                salt: new_salt.clone().as_str(),
-                hash: &new_hash,
-            })
-            .execute(&mut conexion.pool)?;
-
-        Ok(())
-    }
-
-    fn get_salt_hash_from_db(conexion: &mut Conexion) -> Result<(String, String)> {
-        let result = recovery_dsl::recovery
-            .select((recovery_dsl::salt, recovery_dsl::hash))
-            .first::<(String, String)>(&mut conexion.pool)
-            .map_err(|err| anyhow!("Error obtaining salt_hash from db: {}", err))?;
-        Ok(result)
-    }
-
-    fn verify_hash(hash_new: &str, hash_db: &str) -> Result<()> {
-        let hash_db_bytes = BASE64_URL_SAFE.decode(hash_db)?;
-        let hash_new_bytes = BASE64_URL_SAFE.decode(hash_new)?;
-
-        if hash_new_bytes != hash_db_bytes {
-            bail!("Password verification failed");
-        }
-
-        Ok(())
+impl Drop for SensitiveData {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
 fn clear_console() {
     print!("\x1B[2J\x1B[1;1H");
+}
+
+fn conexion(status: bool) -> Result<SqliteConnection> {
+    if status {
+        fs::create_dir(DB_PATH)?;
+    }
+    Ok(SqliteConnection::establish(DB)?)
 }
 
 fn check_name(nombre: &str) -> Result<()> {
@@ -157,135 +68,56 @@ fn check_name(nombre: &str) -> Result<()> {
     Ok(())
 }
 
-fn prompts(p: Prompts) -> Result<String> {
-    let colored = "\x1b[32m->\x1b[0m";
-
-    match p {
-        Prompts::First => Ok(Password::new("Enter Password").without_confirmation().prompt()?),
-        Prompts::Second => Ok(Password::new("Enter new Password").prompt()?),
-        Prompts::Third => Ok(Text::new(colored).prompt()?),
-    }
+fn encrypt_data(data: &[u8], key: &aead::LessSafeKey) -> Result<Vec<u8>> {
+    let nonce = aead::Nonce::assume_unique_for_key([0; 12]);
+    let mut in_out = Vec::from(data);
+    let additional_data = aead::Aad::from(b"");
+    key.seal_in_place_append_tag(nonce, additional_data, &mut in_out)
+        .expect("error encrypting");
+    Ok(in_out)
 }
 
-fn create_schema(conexion: &mut Conexion, init: bool) -> Result<()> {
-    if init {
-        diesel::sql_query(
-            "CREATE TABLE IF NOT EXISTS Recovery (
-                id INTEGER PRIMARY KEY, 
-                hash TEXT NOT NULL, 
-                salt TEXT NOT NULL
-            );
-        ",
-        )
-        .execute(&mut conexion.pool)?;
-    } else {
-        let data = "
-            CREATE TABLE IF NOT EXISTS Almacen (
-                id INTEGER PRIMARY KEY,
-                nombre TEXT NOT NULL,
-                key TEXT NOT NULL
-            );
+fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
+    let data = "
+        CREATE TABLE IF NOT EXISTS Almacen (
+            id INTEGER PRIMARY KEY,
+            nombre TEXT NOT NULL,
+            key BLOB NOT NULL
+        );
             
-            CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
-            CREATE INDEX IF NOT EXISTS id_key ON Almacen(key);
-        ";
+        CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
+    ";
 
-        let data2 = "
-            CREATE TABLE IF NOT EXISTS Almacen_Data (
-                id INTEGER PRIMARY KEY,
-                key TEXT NOT NULL,
-                nonce TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS id_key ON AlmacenData(id);
-        ";
-
-        diesel::sql_query(data).execute(&mut conexion.pool)?;
-        diesel::sql_query(data2).execute(&mut conexion.pool)?;
-    }
+    diesel::sql_query(data).execute(conexion)?;
     Ok(())
 }
 
-fn crypt(conexion: &mut Conexion, associated_data: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    let rand = SystemRandom::new();
-    let mut key_bytes = vec![0; CHACHA20.key_len()];
-
-    rand.fill(&mut key_bytes).expect("msg1");
-    let mut nonce_value = [0; NONCE_LEN];
-    rand.fill(&mut nonce_value).expect("msg2");
-
-    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).expect("err1");
-    let nonce_sequence = SingleNonce(nonce_value);
-    let mut sealing_key = SealingKey::new(unbound_key, nonce_sequence);
-
-    let mut in_out = data.to_vec();
-    let tag = sealing_key
-        .seal_in_place_separate_tag(Aad::from(associated_data), &mut in_out)
-        .expect("err2");
-
-    insert_record(&key_bytes, &nonce_value, conexion).expect("err3");
-
-    Ok([in_out, tag.as_ref().to_vec()].concat())
-}
-
-fn decrypt(
-    key_bytes: &[u8],
-    nonce_value: &[u8],
-    associated_data: &[u8],
-    cypher_text_with_tag: &[u8],
-) -> Result<Vec<u8>> {
-    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, key_bytes).expect("err1");
-    let nonce_sequence = SingleNonce(nonce_value.try_into()?);
-    let mut opening_key = OpeningKey::new(unbound_key, nonce_sequence);
-
-    let mut in_out = cypher_text_with_tag.to_vec();
-    let decrypted_data = opening_key
-        .open_in_place(Aad::from(associated_data), &mut in_out)
-        .expect("err2");
-
-    Ok(decrypted_data.to_vec())
-}
-
-fn decrypt_this(nombre: &String, hash: String, conexion: &mut Conexion) -> Result<Vec<u8>> {
-    let (key_almacen, id) = get_key_id_almacen_from_db(conexion, nombre).expect("ee1");
-    let (key, nonce) = get_key_nonce_almacendata_from_db(conexion, id).expect("ee2");
-
-    let decode_key = BASE64_URL_SAFE.decode(&key_almacen)?.to_vec();
-    let key_decoded = BASE64_URL_SAFE.decode(&key).expect("ee3");
-    let nonce_decoded = BASE64_URL_SAFE.decode(&nonce).expect("ee4");
-
-    let decrypted_data = decrypt(&key_decoded, &nonce_decoded, hash.as_bytes(), &decode_key)?;
-
-    Ok(decrypted_data)
-}
-
-fn add(conexion: &mut Conexion, data: &Almacen) -> Result<()> {
+fn add(conexion: &mut SqliteConnection, key: &LessSafeKey, data: &Almacen) -> Result<()> {
     check_name(&data.nombre)?;
 
     if diesel::select(exists(
         almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&data.nombre)),
     ))
-    .get_result::<bool>(&mut conexion.pool)?
+    .get_result::<bool>(conexion)?
     {
         bail!("Name {} already exist", &data.nombre);
     }
 
-    let (_, hash_db) = Data::get_salt_hash_from_db(conexion)?;
-    let wrapped = crypt(conexion, hash_db.as_bytes(), data.key.as_bytes())?;
+    let encrypted = encrypt_data(&data.key, key)?;
 
     diesel::insert_into(almacen_dsl::almacen)
-        .values(NewRegistro {
+        .values(NewData {
             nombre: &data.nombre,
-            key: &BASE64_URL_SAFE.encode(&wrapped),
+            key: &encrypted,
         })
-        .execute(&mut conexion.pool)?;
+        .execute(conexion)?;
 
     Ok(())
 }
 
-fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
+fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
     let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
-        .execute(&mut conexion.pool)?;
+        .execute(conexion)?;
 
     if rows == 0 {
         bail!("No record found with name {}", name);
@@ -294,11 +126,59 @@ fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
+fn create_key() -> Result<Vec<u8>> {
+    let rng = SystemRandom::new();
+    let key_len = aead::CHACHA20_POLY1305.key_len();
+    let mut key_bytes = vec![0u8; key_len];
+    rng.fill(&mut key_bytes).unwrap();
+    save_key(KEY_PATH, &key_bytes)?;
+
+    // Lock pages in memory to prevent swapping
+    #[cfg(target_os = "windows")]
+    unsafe {
+        winapi::um::memoryapi::VirtualLock(key_bytes.as_ptr() as *mut _, key_bytes.len());
+    }
+
+    #[cfg(target_family = "unix")]
+    unsafe {
+        libc::mlock(key_bytes.as_ptr() as *const libc::c_void, key_bytes.len());
+    }
+    Ok(key_bytes)
+}
+
+fn load_key() -> Result<Vec<u8>> {
+    let mut key = Vec::new();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x80) // ATTRIBUTE: ENCRYPTED
+        .open(KEY_PATH)?;
+
+    file.read_to_end(&mut key)?;
+    Ok(key)
+}
+
+fn save_key<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(0x80) // ATTRIBUTE: ENCRYPTED
+        .open(path)?;
+
+    file.write_all(data)?;
+    Ok(())
+}
+
+fn view_all(
+    conexion: &mut SqliteConnection,
+    key: &LessSafeKey,
+    inicio: &u16,
+    fin: &u16,
+) -> Result<()> {
     let results = almacen_dsl::almacen
         .limit((fin - inicio) as i64)
         .offset(*inicio as i64)
-        .load::<Almacen>(&mut conexion.pool)?;
+        .load::<Almacen>(conexion)?;
 
     if results.is_empty() {
         bail!("No hay registros en el rango especificado");
@@ -317,17 +197,29 @@ fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
         Cell::new("Key").set_alignment(CellAlignment::Center),
     ]);
 
-    let (_, hash_db) = Data::get_salt_hash_from_db(conexion)?;
-
     for row in results {
-        let decrypted = decrypt_this(&row.nombre, hash_db.clone(), conexion)?;
+        let mut sensitive = SensitiveData {
+            key: row.key.clone(),
+            decrypted_data: Vec::new(),
+        };
+
+        let decrypted = key
+            .open_in_place(
+                Nonce::assume_unique_for_key([0; 12]),
+                aead::Aad::from(b""),
+                &mut sensitive.key,
+            )
+            .expect("error decrypting");
+
+        sensitive.decrypted_data = decrypted.to_vec();
 
         tabla.add_row(cRow::from(vec![
             Cell::new(row.id),
             Cell::new(row.nombre),
-            Cell::new(String::from_utf8(decrypted)?),
+            Cell::new(String::from_utf8_lossy(&sensitive.decrypted_data)),
         ]));
     }
+
     println!("{}\n", &tabla);
     println!(
         "Mostrando registros del {} al {} - Total: {}",
@@ -337,23 +229,7 @@ fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
     Ok(())
 }
 
-fn export_all(conexion: &mut Conexion) -> Result<()> {
-    let results = almacen_dsl::almacen.load::<Almacen>(&mut conexion.pool)?;
-
-    let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
-
-    let (_, hash_db) = Data::get_salt_hash_from_db(conexion)?;
-
-    for row in results {
-        let decrypted = decrypt_this(&row.nombre, hash_db.clone(), conexion)?;
-        let result = String::from_utf8(decrypted)?;
-        writer.write_record(&[row.nombre, result])?;
-    }
-
-    Ok(())
-}
-
-fn import_all(conexion: &mut Conexion) -> Result<()> {
+fn import_all(conexion: &mut SqliteConnection, key: &LessSafeKey) -> Result<()> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_path(FILE_IMPORT)?;
@@ -370,64 +246,54 @@ fn import_all(conexion: &mut Conexion) -> Result<()> {
         let _almacen = Almacen {
             id: 0,
             nombre: record[0].to_string(),
-            key: record[1].to_string(),
+            key: record[1].as_bytes().to_vec(),
         };
 
-        add(conexion, &_almacen)?;
+        add(conexion, key, &_almacen)?;
     }
 
     Ok(())
 }
 
-fn insert_record(key_bytes: &[u8], nonce_value: &[u8], conexion: &mut Conexion) -> Result<()> {
-    diesel::insert_into(almacen_data_dsl::almacen_data)
-        .values(NewData {
-            key: &BASE64_URL_SAFE.encode(key_bytes),
-            nonce: &BASE64_URL_SAFE.encode(nonce_value),
-        })
-        .execute(&mut conexion.pool)?;
+fn export_all(conexion: &mut SqliteConnection, key: &LessSafeKey) -> Result<()> {
+    let results = almacen_dsl::almacen.load::<Almacen>(conexion)?;
+
+    let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
+
+    for mut row in results {
+        let decrypted = key
+            .open_in_place(
+                Nonce::assume_unique_for_key([0; 12]),
+                aead::Aad::from(b""),
+                &mut row.key,
+            )
+            .expect("error decrypting");
+
+        let decrypted_ = decrypted.to_vec();
+
+        writer.write_record([
+            row.nombre.as_str(),
+            String::from_utf8_lossy(&decrypted_).as_ref(),
+        ])?;
+    }
     Ok(())
-}
-
-fn get_key_id_almacen_from_db(conexion: &mut Conexion, nombre: &String) -> Result<(String, u16)> {
-    let result = almacen_dsl::almacen
-        .filter(almacen_dsl::nombre.eq(nombre))
-        .select((almacen_dsl::id, almacen_dsl::key))
-        .first::<(i32, String)>(&mut conexion.pool)?;
-
-    let (id, key) = result;
-
-    Ok((key, id as u16))
-}
-
-fn get_key_nonce_almacendata_from_db(conexion: &mut Conexion, id: u16) -> Result<(String, String)> {
-    let result = almacen_data_dsl::almacen_data
-        .filter(almacen_data_dsl::id.eq(id as i32))
-        .select((almacen_data_dsl::key, almacen_data_dsl::nonce))
-        .first::<(String, String)>(&mut conexion.pool)?;
-
-    Ok(result)
 }
 
 fn main() -> Result<()> {
-    let status_ = !Path::new(DB).exists();
+    let status = !Path::new(KEY_PATH).exists();
+    let conex = &mut conexion(status)?;
 
-    let mut data = Data::new(status_)?;
+    let key = {
+        if status {
+            create_schema(conex)?;
+            create_key()?
+        } else {
+            load_key()?
+        }
+    };
 
-    let mut conexion = Conexion::new(status_)?;
-
-    create_schema(&mut conexion, true)?;
-
-    if status_ {
-        data.new_instance(&mut conexion)?;
-        create_schema(&mut conexion, false)?;
-    } else {
-        let (salt_db, hash_db) = Data::get_salt_hash_from_db(&mut conexion)?;
-        let new_hash = data.new_hash(&salt_db)?;
-        Data::verify_hash(&new_hash, &hash_db)?;
-    }
-
-    data.zeroize();
+    let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap();
+    let less_safe_key = LessSafeKey::new(unbound_key);
 
     loop {
         println!(
@@ -444,18 +310,19 @@ fn main() -> Result<()> {
 
         println!(" ");
 
-        let entrada = prompts(Prompts::Third)?;
+        let entrada = Text::new("\x1b[32m->\x1b[0m").prompt()?;
 
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
             ["a", name, privkey] => {
                 add(
-                    &mut conexion,
+                    conex,
+                    &less_safe_key,
                     &Almacen {
                         id: 0,
                         nombre: name.to_string(),
-                        key: privkey.to_string(),
+                        key: privkey.as_bytes().to_vec(),
                     },
                 )?;
 
@@ -466,19 +333,19 @@ fn main() -> Result<()> {
                 println!(" ");
                 let pg_inicio = inicio.parse::<u16>()?;
                 let pg_fin = fin.parse::<u16>()?;
-                view_all(&mut conexion, &pg_inicio, &pg_fin)?;
+                view_all(conex, &less_safe_key, &pg_inicio, &pg_fin)?;
                 println!(" ");
             }
             ["e"] => {
-                export_all(&mut conexion)?;
+                export_all(conex, &less_safe_key)?;
                 clear_console();
             }
             ["i"] => {
-                import_all(&mut conexion)?;
+                import_all(conex, &less_safe_key)?;
                 clear_console();
             }
             ["r", _nombre] => {
-                remove(&mut conexion, _nombre)?;
+                remove(conex, _nombre)?;
                 clear_console();
             }
             ["q"] => {
