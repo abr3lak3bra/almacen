@@ -1,151 +1,140 @@
 use crate::schema::almacen::dsl as almacen_dsl;
-use crate::models::Registro;
-use inquire::Text;
-use models::Almacen;
-use anyhow::{bail, Result};
-use base64::prelude::*;
+use anyhow::{Ok, Result};
 use colored::Colorize;
 use comfy_table::{
-    modifiers::UTF8_ROUND_CORNERS, 
-    presets::UTF8_NO_BORDERS, 
-    Cell, 
-    CellAlignment, 
-    Row as cRow,
+    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
     Table,
 };
-use cryptojs_rust::{
-    aes::{AesDecryptor, AesEncryptor},
-    CryptoOperation, Mode,
-};
-use diesel::{
-    prelude::*,
-    sqlite::SqliteConnection,
+use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
+use inquire::Text;
+use models::{Almacen, NewData};
+use ring::{
+    aead::{self, LessSafeKey, Nonce, CHACHA20_POLY1305},
+    rand::{SecureRandom, SystemRandom},
 };
 use std::{
-    env,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    os::windows::fs::OpenOptionsExt,
     path::Path,
 };
+use zeroize::Zeroize;
 
-pub mod models;
-pub mod schema;
+mod models;
+mod schema;
 
-struct Conexion {
-    pool: SqliteConnection,
-}
-
-struct Password {
-    pwd: String,
-}
-
-const DB: &str = "./db/db.db";
-const DB_PATH: &str = "./db";
 const FILE_EXPORT: &str = "./files/exportar_datos.csv";
 const FILE_IMPORT: &str = "./files/importar_datos.csv";
+const DB: &str = "./private/almacen.db";
 
-impl Conexion {
-    fn new() -> Result<Self> {
-        if !Path::new(DB_PATH).exists() {
-            fs::create_dir(DB_PATH)?;
-        }
-
-        Ok(Self {
-            pool: SqliteConnection::establish(DB)?,
-        })
-    }
-}
-
-impl Password {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            pwd: env::var("PWD")?,
-        })
-    }
-}
+const DB_PATH: &str = "./private";
+const KEY_PATH: &str = "./private/private_key.bin";
 
 fn clear_console() {
     print!("\x1B[2J\x1B[1;1H");
 }
 
-fn create_schema(conexion: &mut Conexion) -> Result<()> {
-    let data = "
-        CREATE TABLE IF NOT EXISTS Almacen (
-            id INTEGER PRIMARY KEY,
-            nombre TEXT NOT NULL,
-            key TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
-        CREATE INDEX IF NOT EXISTS id_key ON Almacen(key);
-    ";
-
-    diesel::sql_query(data).execute(&mut conexion.pool)?;
-    Ok(())
-}
-
-fn remove(conexion: &mut Conexion, name: &str) -> Result<()> {
-    let rows = diesel::delete(almacen_dsl::almacen
-        .filter(almacen_dsl::nombre.eq(name)))
-        .execute(&mut conexion.pool)?;
-
-    if rows == 0 {
-        bail!("No record found with name: {}", name);
+fn lock_memory(data: &mut [u8]) {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        winapi::um::memoryapi::VirtualLock(data.as_ptr() as *mut _, data.len());
     }
 
+    #[cfg(target_family = "unix")]
+    unsafe {
+        libc::mlock(data.as_ptr() as *const libc::c_void, data.len());
+    }
+}
+
+fn conexion(status: bool) -> Result<SqliteConnection> {
+    if status {
+        fs::create_dir(DB_PATH)?;
+    }
+    Ok(SqliteConnection::establish(DB)?)
+}
+
+fn create_key() -> Result<()> {
+    let rng = SystemRandom::new();
+    let mut key_bytes = vec![0u8; CHACHA20_POLY1305.key_len()];
+    rng.fill(&mut key_bytes).expect("Error create key");
+    lock_memory(&mut key_bytes);
+    save_key(KEY_PATH, &key_bytes)?;
     Ok(())
 }
 
-fn encrypt(data: &[u8]) -> Result<Vec<u8>> {
-    let pwd = Password::new()?;
+fn load_key() -> Result<LessSafeKey> {
+    let mut key = Vec::new();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x80) // ATTRIBUTE: ENCRYPTED
+        .open(KEY_PATH)?;
 
-    let mut encryptor = AesEncryptor::new_256_from_password(pwd.pwd.as_bytes(), Mode::CBC)?;
-    encryptor.update(data)?;
+    file.read_to_end(&mut key)?;
+    lock_memory(&mut key);
 
-    Ok(encryptor.finalize()?)
+    let unbound_key =
+        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).expect("Error load key");
+
+    let less_safe_key = LessSafeKey::new(unbound_key);
+    Ok(less_safe_key)
 }
 
-fn decrypt(data: Vec<u8>) -> Result<Vec<u8>> {
-    let pwd = Password::new()?;
+fn save_key<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(0x80) // ATTRIBUTE: ENCRYPTED
+        .open(path)?;
 
-    let salt = &data[..16];
-    let iv = &data[16..32];
-    let ciphertext = &data[32..];
-
-    let mut decryptor =
-        AesDecryptor::new_256_from_password(pwd.pwd.as_bytes(), Mode::CBC, salt, Some(iv))?;
-
-    decryptor.update(ciphertext)?;
-    Ok(decryptor.finalize()?)
+    file.write_all(data)?;
+    Ok(())
 }
 
-fn add(conexion: &mut Conexion, data: &Almacen) -> Result<()> {
-    if almacen_dsl::almacen
-        .filter(almacen_dsl::nombre.eq(&data.nombre))
-        .count()
-        .get_result::<i64>(&mut conexion.pool)?
-        > 0
+fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+    let nonce = aead::Nonce::assume_unique_for_key([0; 12]);
+    let mut in_out = Vec::from(data);
+    let additional_data = aead::Aad::from(b"");
+    let read_key = load_key()?;
+    read_key
+        .seal_in_place_append_tag(nonce, additional_data, &mut in_out)
+        .expect("error encrypting");
+    Ok(in_out)
+}
+
+fn add(conexion: &mut SqliteConnection, data: &Almacen) -> Result<()> {
+    check_name(&data.nombre)?;
+
+    if diesel::select(exists(
+        almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&data.nombre)),
+    ))
+    .get_result::<bool>(conexion)?
     {
-        bail!("Name: {} already exist", &data.nombre);
+        println!("Error: Name {} already exist", &data.nombre);
+        return Ok(())
     }
+
+    let encrypted = encrypt_data(&data.key)?;
 
     diesel::insert_into(almacen_dsl::almacen)
-        .values(Registro {
+        .values(NewData {
             nombre: &data.nombre,
-            key: &data.key,
+            key: &encrypted,
         })
-        .execute(&mut conexion.pool)?;
+        .execute(conexion)?;
 
     Ok(())
 }
 
-fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
+fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<()> {
     let results = almacen_dsl::almacen
         .limit((fin - inicio) as i64)
         .offset(*inicio as i64)
-        .load::<Almacen>(&mut conexion.pool)?;
+        .load::<Almacen>(conexion)?;
 
     if results.is_empty() {
-        bail!("No hay registros en el rango especificado");
+        println!("No hay registros en el rango especificado");
+        return Ok(())
     }
 
     let total = results.len();
@@ -156,19 +145,31 @@ fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
         .apply_modifier(UTF8_ROUND_CORNERS);
 
     tabla.set_header(vec![
+        Cell::new("ID"),
         Cell::new("Nombre"),
         Cell::new("Key").set_alignment(CellAlignment::Center),
     ]);
 
-    for row in results {
-        let decoded = BASE64_STANDARD.decode(&row.key)?;
-        let decrypted = decrypt(decoded)?;
+    let read_key = load_key()?;
+
+    for mut row in results {
+        let decrypted = read_key
+            .open_in_place(
+                Nonce::assume_unique_for_key([0; 12]),
+                aead::Aad::from(b""),
+                &mut row.key,
+            )
+            .expect("error decrypting");
 
         tabla.add_row(cRow::from(vec![
-            Cell::new(row.nombre),
-            Cell::new(String::from_utf8(decrypted)?),
+            Cell::new(row.id),
+            Cell::new(row.nombre.clone()),
+            Cell::new(String::from_utf8_lossy(decrypted)),
         ]));
+
+        decrypted.zeroize();
     }
+
     println!("{}\n", &tabla);
     println!(
         "Mostrando registros del {} al {} - Total: {}",
@@ -178,22 +179,7 @@ fn view_all(conexion: &mut Conexion, inicio: &u16, fin: &u16) -> Result<()> {
     Ok(())
 }
 
-fn export_all(conexion: &mut Conexion) -> Result<()> {
-    let results = almacen_dsl::almacen.load::<Almacen>(&mut conexion.pool)?;
-
-    let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
-
-    for row in results {
-        let decoded = BASE64_STANDARD.decode(&row.key)?;
-        let decrypted = decrypt(decoded)?;
-        let result = String::from_utf8(decrypted)?;
-        writer.write_record(&[row.nombre, result])?;
-    }
-
-    Ok(())
-}
-
-fn import_all(conexion: &mut Conexion) -> Result<()> {
+fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_path(FILE_IMPORT)?;
@@ -202,20 +188,84 @@ fn import_all(conexion: &mut Conexion) -> Result<()> {
         let record = line?;
 
         if record[0].is_empty() {
-            bail!("empty name {}", &record[0]);
+            println!("Error: empty name for key '{}...', skipped.", &record[1][0..4]);
+            continue;
         } else if record[1].is_empty() {
-            bail!("empty key for name: {}", &record[0]);
+            println!("Error: empty key for name: '{}', skipped.", &record[0]);
+            continue;
         }
 
-        let encrypted = encrypt(record[1].as_bytes())?;
-
-        let _almacen = Almacen {
-            id: 0, // Diesel
+        let almacen_ = Almacen {
+            id: 0,
             nombre: record[0].to_string(),
-            key: BASE64_STANDARD.encode(&encrypted),
+            key: record[1].as_bytes().to_vec(),
         };
 
-        add(conexion, &_almacen)?;
+        add(conexion, &almacen_)?;
+    }
+
+    println!("The data has been imported successfully.");
+    Ok(())
+}
+
+fn export_all(conexion: &mut SqliteConnection) -> Result<()> {
+    let results = almacen_dsl::almacen.load::<Almacen>(conexion)?;
+    let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
+
+    let read_key = load_key()?;
+
+    for mut row in results {
+        let decrypted = read_key
+            .open_in_place(
+                Nonce::assume_unique_for_key([0; 12]),
+                aead::Aad::from(b""),
+                &mut row.key,
+            )
+            .expect("error decrypting");
+
+        writer.write_record([row.nombre.as_str(), &String::from_utf8_lossy(decrypted)])?;
+        decrypted.zeroize();
+    }
+    println!("The data has been exported successfully.");
+    Ok(())
+}
+
+fn check_name(nombre: &str) -> Result<()> {
+    if nombre.len() > 9 {
+        println!(
+            "Error: El nombre {}... excede el limite de caracteres permitidos",
+            &nombre[0..9]
+        );
+    }
+
+    if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        println!("Error: El nombre solo puede contener letras, numeros y guiones bajos");
+    }
+
+    Ok(())
+}
+
+fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
+    let data = "
+        CREATE TABLE IF NOT EXISTS Almacen (
+            id INTEGER PRIMARY KEY,
+            nombre TEXT NOT NULL,
+            key BLOB NOT NULL
+        );
+            
+        CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
+    ";
+
+    diesel::sql_query(data).execute(conexion)?;
+    Ok(())
+}
+
+fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
+    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
+        .execute(conexion)?;
+
+    if rows == 0 {
+        println!("No record found with name {}", name);
     }
 
     Ok(())
@@ -223,15 +273,18 @@ fn import_all(conexion: &mut Conexion) -> Result<()> {
 
 fn main() -> Result<()> {
     clear_console();
-    dotenvy::dotenv()?;
 
-    let mut conexion = Conexion::new()?;
+    let status = !Path::new(KEY_PATH).exists();
+    let conex = &mut conexion(status)?;
+
+    if status {
+        create_schema(conex)?;
+        create_key()?;
+    }
 
     loop {
         println!(
-            "{}, {}, {}, {}, {}, {}, {} - abr{}lak{}bra",
-
-            "s".red(),
+            "{}, {}, {}, {}, {}, {} - abr{}lak{}bra",
             "a".green(),
             "v".cyan(),
             "i".purple(),
@@ -244,46 +297,38 @@ fn main() -> Result<()> {
 
         println!(" ");
 
-        let entrada = Text::new("").prompt()?;
+        let entrada = Text::new("\x1b[32m->\x1b[0m").prompt()?;
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
-            ["s"] => {
-                create_schema(&mut conexion)?;
-                clear_console();
-            }
-            ["a", _nombre, _key] => {
-                let encrypted = encrypt(_key.as_bytes())?;
-
+            ["a", name, privkey] => {
                 add(
-                    &mut conexion,
+                    conex,
                     &Almacen {
-                        id: 0, // Diesel
-                        nombre: _nombre.to_string(),
-                        key: BASE64_STANDARD.encode(&encrypted),
+                        id: 0,
+                        nombre: name.to_string(),
+                        key: privkey.as_bytes().to_vec(),
                     },
                 )?;
-                clear_console();
             }
             ["v", inicio, fin] => {
-                clear_console();
                 println!(" ");
                 let pg_inicio = inicio.parse::<u16>()?;
                 let pg_fin = fin.parse::<u16>()?;
-                view_all(&mut conexion, &pg_inicio, &pg_fin)?;
+                view_all(conex, &pg_inicio, &pg_fin)?;
                 println!(" ");
             }
             ["e"] => {
-                export_all(&mut conexion)?;
-                clear_console();
+                export_all(conex)?;
+                println!(" ");
             }
             ["i"] => {
-                import_all(&mut conexion)?;
-                clear_console();
+                import_all(conex)?;
+                println!(" ");
             }
             ["r", _nombre] => {
-                remove(&mut conexion, _nombre)?;
-                clear_console();
+                remove(conex, _nombre)?;
+                println!(" ");
             }
             ["q"] => {
                 println!("Saliendo...");

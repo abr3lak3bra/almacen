@@ -1,21 +1,25 @@
-# Almacen - Simple key store
+# Almacen
 
-Key is encrypted with AES 256, Salt and IV use thread_rng() from fn AesEncryptor (cryptojs_rust).
+Almacen is a Rust app designed to securely store and manage sensitive data using encryption. It utilizes SQLite for data storage and the Ring library for cryptographic operations.
 
-Keys are stored in db/db.db encrypted and base64-encoded.
+- **Private Directory**: Contains sensitive files, including the `private_key.bin`, which stores the encryption key used for encrypt/decrypt data.
 
-## Environment Variables
+## Features
 
-To run this project, you will need to change the `PWD` environment var to your .env file.
+- Secure storage of confidential data in almacen.db using ChaCha20-Poly1305 encryption.
+- Command-line interface for adding, viewing, importing, and exporting data.
+- Memory locking to prevent sensitive data from being swapped to disk.
 
-WARNING! delete `PWD` environment var or delete .env file after use.
+## Prerequisites
 
-## Run
+- [Rust](https://rustup.rs)
 
-Clone the project
+## Setup
+
+Clone the repository
 
 ```bash
-  git clone https://github.com/abr3lak3bra/almacen
+  git clone https://github.com/abr3lak3bra/almacen.git
 ```
 
 Go to the project directory
@@ -24,7 +28,7 @@ Go to the project directory
   cd almacen
 ```
 
-Run
+## Run
 
 ```bash
   cargo run
@@ -32,9 +36,8 @@ Run
 
 ## Menu Usage
 ```bash
-s -> Setup
 a -> Add -> Usage: a testi1 0xac....
-v -> View -> Usage: v 0 10 -> this will display records from id 0 to 10
+v -> View -> Usage: v 0 10 -> Display records from id 0 to 10
 i -> Import
 e -> Export
 r -> Remove -> Usage: r testi1
