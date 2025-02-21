@@ -1,18 +1,18 @@
 # Almacen
 
-Almacen is a Rust-based application designed to securely store and manage sensitive data using encryption. It utilizes SQLite for data storage and the Ring library for cryptographic operations.
+Almacen is a Rust app designed to securely store and manage sensitive data using encryption. It utilizes SQLite for data storage and the Ring library for cryptographic operations.
 
 - **Private Directory**: Contains sensitive files, including the `private_key.bin`, which stores the encryption key used for encrypt/decrypt data.
 
 ## Features
 
-- Secure storage of sensitive data using ChaCha20-Poly1305 encryption.
+- Secure storage of confidential data in almacen.db using ChaCha20-Poly1305 encryption.
 - Command-line interface for adding, viewing, importing, and exporting data.
 - Memory locking to prevent sensitive data from being swapped to disk.
 
 ## Prerequisites
 
-- Rust and Cargo.
+- [Rust](https://rustup.rs)
 
 ## Setup
 

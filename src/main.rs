@@ -1,5 +1,5 @@
 use crate::schema::almacen::dsl as almacen_dsl;
-use anyhow::{bail, Ok, Result};
+use anyhow::{Ok, Result};
 use colored::Colorize;
 use comfy_table::{
     modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
@@ -23,11 +23,12 @@ use zeroize::Zeroize;
 mod models;
 mod schema;
 
-const DB: &str = "./private/almacen.db";
-const DB_PATH: &str = "./private";
-const KEY_PATH: &str = "./private/private_key.bin";
 const FILE_EXPORT: &str = "./files/exportar_datos.csv";
 const FILE_IMPORT: &str = "./files/importar_datos.csv";
+const DB: &str = "./private/almacen.db";
+
+const DB_PATH: &str = "./private";
+const KEY_PATH: &str = "./private/private_key.bin";
 
 fn clear_console() {
     print!("\x1B[2J\x1B[1;1H");
@@ -109,7 +110,8 @@ fn add(conexion: &mut SqliteConnection, data: &Almacen) -> Result<()> {
     ))
     .get_result::<bool>(conexion)?
     {
-        bail!("Name {} already exist", &data.nombre);
+        println!("Error: Name {} already exist", &data.nombre);
+        return Ok(())
     }
 
     let encrypted = encrypt_data(&data.key)?;
@@ -131,7 +133,8 @@ fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<
         .load::<Almacen>(conexion)?;
 
     if results.is_empty() {
-        bail!("No hay registros en el rango especificado");
+        println!("No hay registros en el rango especificado");
+        return Ok(())
     }
 
     let total = results.len();
@@ -185,9 +188,11 @@ fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
         let record = line?;
 
         if record[0].is_empty() {
-            bail!("empty name {}", &record[0]);
+            println!("Error: empty name for key '{}...', skipped.", &record[1][0..4]);
+            continue;
         } else if record[1].is_empty() {
-            bail!("empty key for name: {}", &record[0]);
+            println!("Error: empty key for name: '{}', skipped.", &record[0]);
+            continue;
         }
 
         let almacen_ = Almacen {
@@ -199,6 +204,7 @@ fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
         add(conexion, &almacen_)?;
     }
 
+    println!("The data has been imported successfully.");
     Ok(())
 }
 
@@ -220,19 +226,20 @@ fn export_all(conexion: &mut SqliteConnection) -> Result<()> {
         writer.write_record([row.nombre.as_str(), &String::from_utf8_lossy(decrypted)])?;
         decrypted.zeroize();
     }
+    println!("The data has been exported successfully.");
     Ok(())
 }
 
 fn check_name(nombre: &str) -> Result<()> {
     if nombre.len() > 9 {
-        bail!(
-            "El nombre {}... excede el limite de caracteres permitidos",
+        println!(
+            "Error: El nombre {}... excede el limite de caracteres permitidos",
             &nombre[0..9]
         );
     }
 
     if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        bail!("El nombre solo puede contener letras, numeros y guiones bajos");
+        println!("Error: El nombre solo puede contener letras, numeros y guiones bajos");
     }
 
     Ok(())
@@ -258,13 +265,15 @@ fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
         .execute(conexion)?;
 
     if rows == 0 {
-        bail!("No record found with name {}", name);
+        println!("No record found with name {}", name);
     }
 
     Ok(())
 }
 
 fn main() -> Result<()> {
+    clear_console();
+
     let status = !Path::new(KEY_PATH).exists();
     let conex = &mut conexion(status)?;
 
@@ -289,7 +298,6 @@ fn main() -> Result<()> {
         println!(" ");
 
         let entrada = Text::new("\x1b[32m->\x1b[0m").prompt()?;
-
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {
@@ -302,11 +310,8 @@ fn main() -> Result<()> {
                         key: privkey.as_bytes().to_vec(),
                     },
                 )?;
-
-                clear_console();
             }
             ["v", inicio, fin] => {
-                clear_console();
                 println!(" ");
                 let pg_inicio = inicio.parse::<u16>()?;
                 let pg_fin = fin.parse::<u16>()?;
@@ -315,15 +320,15 @@ fn main() -> Result<()> {
             }
             ["e"] => {
                 export_all(conex)?;
-                clear_console();
+                println!(" ");
             }
             ["i"] => {
                 import_all(conex)?;
-                clear_console();
+                println!(" ");
             }
             ["r", _nombre] => {
                 remove(conex, _nombre)?;
-                clear_console();
+                println!(" ");
             }
             ["q"] => {
                 println!("Saliendo...");
