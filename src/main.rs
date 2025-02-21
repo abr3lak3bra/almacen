@@ -54,7 +54,7 @@ fn conexion(status: bool) -> Result<SqliteConnection> {
     Ok(SqliteConnection::establish(DB)?)
 }
 
-fn create_key() -> Result<LessSafeKey> {
+fn create_key() -> Result<()> {
     let rng = SystemRandom::new();
     let mut key_bytes = vec![0u8; CHACHA20_POLY1305.key_len()];
     rng.fill(&mut key_bytes).unwrap();
@@ -62,10 +62,7 @@ fn create_key() -> Result<LessSafeKey> {
 
     lock_memory(&mut key_bytes);
 
-    let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes).unwrap();
-    let less_safe_key = LessSafeKey::new(unbound_key);
-
-    Ok(less_safe_key)
+    Ok(())
 }
 
 fn load_key() -> Result<LessSafeKey> {
