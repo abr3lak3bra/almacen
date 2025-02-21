@@ -1,7 +1,8 @@
 use crate::schema::almacen;
 use diesel::prelude::*;
+use zeroize::ZeroizeOnDrop;
 
-#[derive(Queryable)]
+#[derive(ZeroizeOnDrop, Queryable)]
 #[diesel(table_name = almacen)]
 pub struct Almacen {
     pub id: i32,

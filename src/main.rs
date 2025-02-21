@@ -23,6 +23,7 @@ mod models;
 mod schema;
 use crate::schema::almacen::dsl as almacen_dsl;
 use models::{Almacen, NewData};
+use ring::aead::CHACHA20_POLY1305;
 
 const DB: &str = "./private/almacen.db";
 const DB_PATH: &str = "./private";
@@ -30,20 +31,20 @@ const KEY_PATH: &str = "./private/private_key.bin";
 const FILE_EXPORT: &str = "./files/exportar_datos.csv";
 const FILE_IMPORT: &str = "./files/importar_datos.csv";
 
-#[derive(Zeroize)]
-struct SensitiveData {
-    key: Vec<u8>,
-    decrypted_data: Vec<u8>,
-}
-
-impl Drop for SensitiveData {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
 fn clear_console() {
     print!("\x1B[2J\x1B[1;1H");
+}
+
+fn lock_memory(data: &mut [u8]) {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        winapi::um::memoryapi::VirtualLock(data.as_ptr() as *mut _, data.len());
+    }
+
+    #[cfg(target_family = "unix")]
+    unsafe {
+        libc::mlock(data.as_ptr() as *const libc::c_void, data.len());
+    }
 }
 
 fn conexion(status: bool) -> Result<SqliteConnection> {
@@ -53,100 +54,21 @@ fn conexion(status: bool) -> Result<SqliteConnection> {
     Ok(SqliteConnection::establish(DB)?)
 }
 
-fn check_name(nombre: &str) -> Result<()> {
-    if nombre.len() > 9 {
-        bail!(
-            "El nombre {}... excede el limite de caracteres permitidos",
-            &nombre[0..9]
-        );
-    }
-
-    if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        bail!("El nombre solo puede contener letras, numeros y guiones bajos");
-    }
-
-    Ok(())
-}
-
-fn encrypt_data(data: &[u8], key: &aead::LessSafeKey) -> Result<Vec<u8>> {
-    let nonce = aead::Nonce::assume_unique_for_key([0; 12]);
-    let mut in_out = Vec::from(data);
-    let additional_data = aead::Aad::from(b"");
-    key.seal_in_place_append_tag(nonce, additional_data, &mut in_out)
-        .expect("error encrypting");
-    Ok(in_out)
-}
-
-fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
-    let data = "
-        CREATE TABLE IF NOT EXISTS Almacen (
-            id INTEGER PRIMARY KEY,
-            nombre TEXT NOT NULL,
-            key BLOB NOT NULL
-        );
-            
-        CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
-    ";
-
-    diesel::sql_query(data).execute(conexion)?;
-    Ok(())
-}
-
-fn add(conexion: &mut SqliteConnection, key: &LessSafeKey, data: &Almacen) -> Result<()> {
-    check_name(&data.nombre)?;
-
-    if diesel::select(exists(
-        almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&data.nombre)),
-    ))
-    .get_result::<bool>(conexion)?
-    {
-        bail!("Name {} already exist", &data.nombre);
-    }
-
-    let encrypted = encrypt_data(&data.key, key)?;
-
-    diesel::insert_into(almacen_dsl::almacen)
-        .values(NewData {
-            nombre: &data.nombre,
-            key: &encrypted,
-        })
-        .execute(conexion)?;
-
-    Ok(())
-}
-
-fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
-    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
-        .execute(conexion)?;
-
-    if rows == 0 {
-        bail!("No record found with name {}", name);
-    }
-
-    Ok(())
-}
-
-fn create_key() -> Result<Vec<u8>> {
+fn create_key() -> Result<LessSafeKey> {
     let rng = SystemRandom::new();
-    let key_len = aead::CHACHA20_POLY1305.key_len();
-    let mut key_bytes = vec![0u8; key_len];
+    let mut key_bytes = vec![0u8; CHACHA20_POLY1305.key_len()];
     rng.fill(&mut key_bytes).unwrap();
     save_key(KEY_PATH, &key_bytes)?;
 
-    // Lock pages in memory to prevent swapping
-    #[cfg(target_os = "windows")]
-    unsafe {
-        winapi::um::memoryapi::VirtualLock(key_bytes.as_ptr() as *mut _, key_bytes.len());
-    }
+    lock_memory(&mut key_bytes);
 
-    #[cfg(target_family = "unix")]
-    unsafe {
-        libc::mlock(key_bytes.as_ptr() as *const libc::c_void, key_bytes.len());
-    }
-    Ok(key_bytes)
+    let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes).unwrap();
+    let less_safe_key = LessSafeKey::new(unbound_key);
+
+    Ok(less_safe_key)
 }
 
-fn load_key() -> Result<Vec<u8>> {
+fn load_key() -> Result<LessSafeKey> {
     let mut key = Vec::new();
     let mut file = OpenOptions::new()
         .read(true)
@@ -154,7 +76,13 @@ fn load_key() -> Result<Vec<u8>> {
         .open(KEY_PATH)?;
 
     file.read_to_end(&mut key)?;
-    Ok(key)
+
+    lock_memory(&mut key);
+
+    let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap();
+    let less_safe_key = LessSafeKey::new(unbound_key);
+
+    Ok(less_safe_key)
 }
 
 fn save_key<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
@@ -169,12 +97,41 @@ fn save_key<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn view_all(
-    conexion: &mut SqliteConnection,
-    key: &LessSafeKey,
-    inicio: &u16,
-    fin: &u16,
-) -> Result<()> {
+fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
+    let nonce = aead::Nonce::assume_unique_for_key([0; 12]);
+    let mut in_out = Vec::from(data);
+    let additional_data = aead::Aad::from(b"");
+    let read_key = load_key()?;
+    read_key
+        .seal_in_place_append_tag(nonce, additional_data, &mut in_out)
+        .expect("error encrypting");
+    Ok(in_out)
+}
+
+fn add(conexion: &mut SqliteConnection, data: &Almacen) -> Result<()> {
+    check_name(&data.nombre)?;
+
+    if diesel::select(exists(
+        almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&data.nombre)),
+    ))
+    .get_result::<bool>(conexion)?
+    {
+        bail!("Name {} already exist", &data.nombre);
+    }
+
+    let encrypted = encrypt_data(&data.key)?;
+
+    diesel::insert_into(almacen_dsl::almacen)
+        .values(NewData {
+            nombre: &data.nombre,
+            key: &encrypted,
+        })
+        .execute(conexion)?;
+
+    Ok(())
+}
+
+fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<()> {
     let results = almacen_dsl::almacen
         .limit((fin - inicio) as i64)
         .offset(*inicio as i64)
@@ -197,27 +154,24 @@ fn view_all(
         Cell::new("Key").set_alignment(CellAlignment::Center),
     ]);
 
-    for row in results {
-        let mut sensitive = SensitiveData {
-            key: row.key.clone(),
-            decrypted_data: Vec::new(),
-        };
+    let read_key = load_key()?;
 
-        let decrypted = key
+    for mut row in results {
+        let decrypted = read_key
             .open_in_place(
                 Nonce::assume_unique_for_key([0; 12]),
                 aead::Aad::from(b""),
-                &mut sensitive.key,
+                &mut row.key,
             )
             .expect("error decrypting");
 
-        sensitive.decrypted_data = decrypted.to_vec();
-
         tabla.add_row(cRow::from(vec![
             Cell::new(row.id),
-            Cell::new(row.nombre),
-            Cell::new(String::from_utf8_lossy(&sensitive.decrypted_data)),
+            Cell::new(row.nombre.clone()),
+            Cell::new(String::from_utf8_lossy(decrypted)),
         ]));
+
+        decrypted.zeroize();
     }
 
     println!("{}\n", &tabla);
@@ -229,7 +183,7 @@ fn view_all(
     Ok(())
 }
 
-fn import_all(conexion: &mut SqliteConnection, key: &LessSafeKey) -> Result<()> {
+fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_path(FILE_IMPORT)?;
@@ -243,25 +197,26 @@ fn import_all(conexion: &mut SqliteConnection, key: &LessSafeKey) -> Result<()> 
             bail!("empty key for name: {}", &record[0]);
         }
 
-        let _almacen = Almacen {
+        let almacen_ = Almacen {
             id: 0,
             nombre: record[0].to_string(),
             key: record[1].as_bytes().to_vec(),
         };
 
-        add(conexion, key, &_almacen)?;
+        add(conexion, &almacen_)?;
     }
 
     Ok(())
 }
 
-fn export_all(conexion: &mut SqliteConnection, key: &LessSafeKey) -> Result<()> {
+fn export_all(conexion: &mut SqliteConnection) -> Result<()> {
     let results = almacen_dsl::almacen.load::<Almacen>(conexion)?;
-
     let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
 
+    let read_key = load_key()?;
+
     for mut row in results {
-        let decrypted = key
+        let decrypted = read_key
             .open_in_place(
                 Nonce::assume_unique_for_key([0; 12]),
                 aead::Aad::from(b""),
@@ -269,13 +224,50 @@ fn export_all(conexion: &mut SqliteConnection, key: &LessSafeKey) -> Result<()> 
             )
             .expect("error decrypting");
 
-        let decrypted_ = decrypted.to_vec();
-
-        writer.write_record([
-            row.nombre.as_str(),
-            String::from_utf8_lossy(&decrypted_).as_ref(),
-        ])?;
+        writer.write_record([row.nombre.as_str(), &String::from_utf8_lossy(decrypted)])?;
+        decrypted.zeroize();
     }
+    Ok(())
+}
+
+fn check_name(nombre: &str) -> Result<()> {
+    if nombre.len() > 9 {
+        bail!(
+            "El nombre {}... excede el limite de caracteres permitidos",
+            &nombre[0..9]
+        );
+    }
+
+    if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        bail!("El nombre solo puede contener letras, numeros y guiones bajos");
+    }
+
+    Ok(())
+}
+
+fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
+    let data = "
+        CREATE TABLE IF NOT EXISTS Almacen (
+            id INTEGER PRIMARY KEY,
+            nombre TEXT NOT NULL,
+            key BLOB NOT NULL
+        );
+            
+        CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
+    ";
+
+    diesel::sql_query(data).execute(conexion)?;
+    Ok(())
+}
+
+fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
+    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(name)))
+        .execute(conexion)?;
+
+    if rows == 0 {
+        bail!("No record found with name {}", name);
+    }
+
     Ok(())
 }
 
@@ -283,17 +275,10 @@ fn main() -> Result<()> {
     let status = !Path::new(KEY_PATH).exists();
     let conex = &mut conexion(status)?;
 
-    let key = {
-        if status {
-            create_schema(conex)?;
-            create_key()?
-        } else {
-            load_key()?
-        }
-    };
-
-    let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap();
-    let less_safe_key = LessSafeKey::new(unbound_key);
+    if status {
+        create_schema(conex)?; 
+        create_key()?;
+    }
 
     loop {
         println!(
@@ -316,9 +301,9 @@ fn main() -> Result<()> {
 
         match partes.as_slice() {
             ["a", name, privkey] => {
+
                 add(
                     conex,
-                    &less_safe_key,
                     &Almacen {
                         id: 0,
                         nombre: name.to_string(),
@@ -333,15 +318,15 @@ fn main() -> Result<()> {
                 println!(" ");
                 let pg_inicio = inicio.parse::<u16>()?;
                 let pg_fin = fin.parse::<u16>()?;
-                view_all(conex, &less_safe_key, &pg_inicio, &pg_fin)?;
+                view_all(conex, &pg_inicio, &pg_fin)?;
                 println!(" ");
             }
             ["e"] => {
-                export_all(conex, &less_safe_key)?;
+                export_all(conex)?;
                 clear_console();
             }
             ["i"] => {
-                import_all(conex, &less_safe_key)?;
+                import_all(conex)?;
                 clear_console();
             }
             ["r", _nombre] => {
