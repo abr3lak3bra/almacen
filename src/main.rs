@@ -1,3 +1,4 @@
+use crate::schema::almacen::dsl as almacen_dsl;
 use anyhow::{bail, Ok, Result};
 use colored::Colorize;
 use comfy_table::{
@@ -6,24 +7,21 @@ use comfy_table::{
 };
 use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
 use inquire::Text;
+use models::{Almacen, NewData};
 use ring::{
-    aead,
-    aead::{LessSafeKey, Nonce},
+    aead::{self, LessSafeKey, Nonce, CHACHA20_POLY1305},
     rand::{SecureRandom, SystemRandom},
 };
-use std::os::windows::fs::OpenOptionsExt;
 use std::{
-    fs,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
+    os::windows::fs::OpenOptionsExt,
     path::Path,
 };
 use zeroize::Zeroize;
+
 mod models;
 mod schema;
-use crate::schema::almacen::dsl as almacen_dsl;
-use models::{Almacen, NewData};
-use ring::aead::CHACHA20_POLY1305;
 
 const DB: &str = "./private/almacen.db";
 const DB_PATH: &str = "./private";
@@ -57,11 +55,9 @@ fn conexion(status: bool) -> Result<SqliteConnection> {
 fn create_key() -> Result<()> {
     let rng = SystemRandom::new();
     let mut key_bytes = vec![0u8; CHACHA20_POLY1305.key_len()];
-    rng.fill(&mut key_bytes).unwrap();
-    save_key(KEY_PATH, &key_bytes)?;
-
+    rng.fill(&mut key_bytes).expect("Error create key");
     lock_memory(&mut key_bytes);
-
+    save_key(KEY_PATH, &key_bytes)?;
     Ok(())
 }
 
@@ -73,12 +69,12 @@ fn load_key() -> Result<LessSafeKey> {
         .open(KEY_PATH)?;
 
     file.read_to_end(&mut key)?;
-
     lock_memory(&mut key);
 
-    let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap();
-    let less_safe_key = LessSafeKey::new(unbound_key);
+    let unbound_key =
+        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).expect("Error load key");
 
+    let less_safe_key = LessSafeKey::new(unbound_key);
     Ok(less_safe_key)
 }
 
@@ -273,7 +269,7 @@ fn main() -> Result<()> {
     let conex = &mut conexion(status)?;
 
     if status {
-        create_schema(conex)?; 
+        create_schema(conex)?;
         create_key()?;
     }
 
@@ -298,7 +294,6 @@ fn main() -> Result<()> {
 
         match partes.as_slice() {
             ["a", name, privkey] => {
-
                 add(
                     conex,
                     &Almacen {

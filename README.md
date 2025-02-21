@@ -1,19 +1,25 @@
-# Almacen - Interactive key store
+# Almacen
 
-Argon2id for password hash.
+Almacen is a Rust-based application designed to securely store and manage sensitive data using encryption. It utilizes SQLite for data storage and the Ring library for cryptographic operations.
 
-Ring with ChaCha20 for key.
+- **Private Directory**: Contains sensitive files, including the `private_key.bin`, which stores the encryption key used for encrypt/decrypt data.
 
-Keys are stored in db/db.db.
+## Features
 
-Ring with ChaCha20 for the file db.db.
+- Secure storage of sensitive data using ChaCha20-Poly1305 encryption.
+- Command-line interface for adding, viewing, importing, and exporting data.
+- Memory locking to prevent sensitive data from being swapped to disk.
 
-## Run
+## Prerequisites
 
-Clone the project
+- Rust and Cargo.
+
+## Setup
+
+Clone the repository
 
 ```bash
-  git clone https://github.com/abr3lak3bra/almacen
+  git clone https://github.com/abr3lak3bra/almacen.git
 ```
 
 Go to the project directory
@@ -22,7 +28,7 @@ Go to the project directory
   cd almacen
 ```
 
-Run
+## Run
 
 ```bash
   cargo run
