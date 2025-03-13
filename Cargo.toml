@@ -1,17 +1,26 @@
 [package]
 name = "almacen"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 
+[lib]
+name = "core"
+path = "src/core.rs"
+crate-type = ["lib"]
+
+[[bin]]
+name = "almacen"
+path = "src/main.rs"
+
 [dependencies]
-diesel = { version = "2.2.7", features = ["sqlite"] }
+diesel = { version = "2.2.8", features = ["sqlite"] }
 libsqlite3-sys = { version = "0.31.0", features = ["bundled"] }
 winapi = { version = "0.3.9", features = ["memoryapi"] }
 zeroize = { version = "1.8.1", features = ["zeroize_derive"] }
-ring = "0.17.9"
+ring = "0.17.14"
 colored = "3.0.0"
-anyhow = "1.0.96"
+anyhow = "1.0.97"
 comfy-table = "7.1.4"
 inquire = "0.7.5"
 csv = "1.3.1"
-libc = "0.2.169"
+libc = "0.2.171"
