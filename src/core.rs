@@ -326,7 +326,6 @@ pub fn init() -> Result<()> {
 
         match partes.as_slice() {
             ["a", name, privkey] => {
-                println!(" ");
                 add(
                     conex,
                     &models::Almacen {
@@ -335,7 +334,7 @@ pub fn init() -> Result<()> {
                         key: privkey.as_bytes().to_vec(),
                     },
                 )?;
-                println!(" ");
+                println!("Ok.\n");
             }
             ["v", inicio, fin] => {
                 println!(" ");
@@ -353,7 +352,6 @@ pub fn init() -> Result<()> {
                 println!(" ");
             }
             ["r", _nombre] => {
-                println!(" ");
                 remove(conex, _nombre)?;
                 println!(" ");
             }
