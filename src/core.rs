@@ -118,7 +118,7 @@ fn add(conexion: &mut SqliteConnection, data: &models::Almacen) -> Result<()> {
     ))
     .get_result::<bool>(conexion)?
     {
-        println!("Error: Name '{}' already exist", &data.nombre);
+        println!("Error: '{}' already exist, skipped.", &data.nombre);
         return Ok(());
     }
 
@@ -141,7 +141,7 @@ fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<
         .load::<models::Almacen>(conexion)?;
 
     if results.is_empty() {
-        println!("No hay registros en el rango especificado");
+        println!("Error: No records found in the specified range");
         return Ok(());
     }
 
@@ -186,7 +186,7 @@ fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<
 
     println!("{}\n", &tabla);
     println!(
-        "Mostrando registros del {} al {} - Total: {} - Total DB: {}",
+        "Showing records from id {} to {} - Found: {} - DB Total: {}",
         &inicio, &fin, &total, total_db
     );
 
@@ -204,12 +204,12 @@ fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
 
         if record[0].is_empty() {
             println!(
-                "Error: empty name for key '{}...', skipped.",
-                &record[1][0..4]
+                "Error: '{}' has no name, skipped.",
+                &record[1][0..5]
             );
             continue;
         } else if record[1].is_empty() {
-            println!("Error: empty key for name: '{}', skipped.", &record[0]);
+            println!("Error: Empty key for name: '{}', skipped.", &record[0]);
             continue;
         }
 
@@ -222,7 +222,7 @@ fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
         add(conexion, &almacen_)?;
     }
 
-    println!("The data has been imported successfully.");
+    println!("Ok.");
     Ok(())
 }
 
@@ -246,21 +246,21 @@ fn export_all(conexion: &mut SqliteConnection) -> Result<()> {
         writer.write_record([row.nombre.as_str(), &String::from_utf8_lossy(decrypted)])?;
         decrypted.zeroize();
     }
-    println!("The data has been exported successfully.");
+    println!("Data has been exported successfully");
     Ok(())
 }
 
 fn check_name(nombre: &str) -> bool {
     if nombre.len() > 9 {
         println!(
-            "Error: El nombre '{}...' excede el limite de caracteres permitidos",
+            "Error: Name '{}...' exceeds the allowed length",
             &nombre[0..9]
         );
         return false;
     }
 
     if !nombre.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        println!("Error: El nombre solo puede contener letras, numeros y guiones bajos");
+        println!("Error: Name can only contain letters, numbers and underscores");
         return false;
     }
 
@@ -284,13 +284,14 @@ fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
 
 fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
     let rows = diesel::delete(almacen_dsl::almacen
-        .filter(almacen_dsl::nombre.eq(name)))
+        .filter(almacen_dsl::nombre.eq(&name)))
         .execute(conexion)?;
 
     if rows == 0 {
-        println!("No record found with name '{}'", name);
+        println!("Error: No record found with name '{}'", &name);
     }
 
+    println!("'{}' has been successfully deleted", &name);
     Ok(())
 }
 
@@ -325,6 +326,7 @@ pub fn init() -> Result<()> {
 
         match partes.as_slice() {
             ["a", name, privkey] => {
+                println!(" ");
                 add(
                     conex,
                     &models::Almacen {
@@ -333,6 +335,7 @@ pub fn init() -> Result<()> {
                         key: privkey.as_bytes().to_vec(),
                     },
                 )?;
+                println!(" ");
             }
             ["v", inicio, fin] => {
                 println!(" ");
@@ -350,6 +353,7 @@ pub fn init() -> Result<()> {
                 println!(" ");
             }
             ["r", _nombre] => {
+                println!(" ");
                 remove(conex, _nombre)?;
                 println!(" ");
             }

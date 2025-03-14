@@ -1,16 +1,16 @@
 [package]
 name = "almacen"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
+
+[[bin]]
+name = "almacen"
+path = "src/main.rs"
 
 [lib]
 name = "core"
 path = "src/core.rs"
 crate-type = ["lib"]
-
-[[bin]]
-name = "almacen"
-path = "src/main.rs"
 
 [dependencies]
 diesel = { version = "2.2.8", features = ["sqlite"] }
