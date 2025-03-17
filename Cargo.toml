@@ -1,6 +1,6 @@
 [package]
 name = "almacen"
-version = "2.0.3"
+version = "2.1.0"
 edition = "2021"
 
 [[bin]]
@@ -24,3 +24,4 @@ comfy-table = "7.1.4"
 inquire = "0.7.5"
 csv = "1.3.1"
 libc = "0.2.171"
+base64 = "0.22.1"

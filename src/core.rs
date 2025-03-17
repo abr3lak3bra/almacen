@@ -1,12 +1,12 @@
-use crate::schema::almacen::dsl as almacen_dsl;
-use anyhow::{Ok, Result};
+use crate::schema::{almacen::dsl as almacen_dsl, usermaster::dsl as users_dsl};
+use anyhow::{anyhow, Result};
 use colored::Colorize;
 use comfy_table::{
     modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
     Table,
 };
 use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
-use inquire::Text;
+use inquire::{Password, PasswordDisplayMode::Masked, Text};
 use ring::{
     aead::{self, LessSafeKey, CHACHA20_POLY1305, NONCE_LEN},
     rand::{SecureRandom, SystemRandom},
@@ -16,18 +16,22 @@ use std::{
     io::{Read, Write},
     os::windows::fs::OpenOptionsExt,
     path::Path,
+    sync::OnceLock,
 };
 use zeroize::Zeroize;
 
-pub mod models;
-pub mod schema;
+mod auth;
+mod constantes;
+mod models;
+mod schema;
 
-pub const FILE_EXPORT: &str = "./files/exportar_datos.csv";
-pub const FILE_IMPORT: &str = "./files/importar_datos.csv";
-pub const DB: &str = "./private/almacen.db";
+pub enum Prompts {
+    NewPassword,
+    NewLogin,
+    Init,
+}
 
-pub const DB_PATH: &str = "./private";
-pub const KEY_PATH: &str = "./private/private_key.bin";
+static ENCRYPTION_KEY: OnceLock<LessSafeKey> = OnceLock::new();
 
 fn lock_memory(data: &mut [u8]) {
     #[cfg(target_os = "windows")]
@@ -43,35 +47,82 @@ fn lock_memory(data: &mut [u8]) {
 
 fn conexion(status: bool) -> Result<SqliteConnection> {
     if status {
-        fs::create_dir(DB_PATH)?;
+        fs::create_dir(constantes::DB_PATH)?;
     }
-    Ok(SqliteConnection::establish(DB)?)
+    Ok(SqliteConnection::establish(constantes::DB)?)
 }
 
-fn create_key() -> Result<()> {
-    let rng = SystemRandom::new();
-    let mut key_bytes = vec![0u8; CHACHA20_POLY1305.key_len()];
-    rng.fill(&mut key_bytes).expect("Error create key");
-    lock_memory(&mut key_bytes);
-    save_key(KEY_PATH, &key_bytes)?;
+fn authenticate(conexion: &mut SqliteConnection, password: &str) -> Result<bool> {
+    let result = users_dsl::usermaster.first::<models::User>(conexion);
+
+    match result {
+        Ok(user) => auth::verify_pwd(password, &user.hash),
+        Err(_) => Ok(false),
+    }
+}
+
+fn new_pwd(conexion: &mut SqliteConnection, pwd: &str) -> Result<()> {
+    let hash = auth::hash_pwd(pwd)?;
+
+    diesel::insert_into(users_dsl::usermaster)
+        .values(models::NewUser { hash: &hash })
+        .execute(conexion)?;
     Ok(())
 }
 
-fn load_key() -> Result<LessSafeKey> {
-    let mut key = Vec::new();
+fn prompts(p: Prompts) -> Result<String> {
+    match p {
+        Prompts::NewPassword => Ok(Password::new("New Password: ")
+            .with_display_mode(Masked)
+            .prompt()?),
+        Prompts::NewLogin => Ok(Password::new("Enter Password")
+            .without_confirmation()
+            .prompt()?),
+        Prompts::Init => Ok(Text::new("\x1b[32m->\x1b[0m").prompt()?),
+    }
+}
+
+fn create_key() -> Result<()> {
+    let mut key_bytes = vec![0u8; CHACHA20_POLY1305.key_len()];
+    SystemRandom::new()
+        .fill(&mut key_bytes)
+        .map_err(|_| anyhow!("Error: Failed to generate random key"))?;
+
+    lock_memory(&mut key_bytes);
+
+    let mut data = Vec::new();
+    data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+    data.extend_from_slice(&key_bytes);
+
+    save_key(constantes::KEY_PATH, &data)?;
+    Ok(())
+}
+
+fn load_key() -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(0x80)
-        .open(KEY_PATH)?;
+        .open(constantes::KEY_PATH)?;
 
-    file.read_to_end(&mut key)?;
+    let file_size = file.metadata()?.len() as usize;
+    let mut buffer = vec![0u8; file_size];
+    file.read_exact(&mut buffer)?;
+
+    let key_size = u32::from_le_bytes(buffer[..4].try_into()?) as usize;
+    let mut key = buffer[4..4 + key_size].to_vec();
     lock_memory(&mut key);
+
+    auth::derive_key(&key)?;
 
     let unbound_key =
         aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key).expect("Error load key");
-
     let less_safe_key = LessSafeKey::new(unbound_key);
-    Ok(less_safe_key)
+
+    ENCRYPTION_KEY
+        .set(less_safe_key)
+        .map_err(|_| anyhow!("Error: Failed to set encryption key"))?;
+
+    Ok(())
 }
 
 fn save_key<P: AsRef<Path>>(path: P, data: &[u8]) -> Result<()> {
@@ -90,17 +141,19 @@ fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
     SystemRandom::new()
         .fill(&mut nonce_bytes)
-        .expect("error fill nonce");
+        .map_err(|_| anyhow!("Error: Failed to generate nonce"))?;
 
-    let nonce =
-        aead::Nonce::try_assume_unique_for_key(&nonce_bytes).expect("error construct nonce");
+    let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes)
+        .map_err(|_| anyhow!("Error: Invalid nonce length"))?;
     let mut in_out = Vec::from(data);
     let additional_data = aead::Aad::from(b"");
-    let read_key = load_key()?;
+    let read_key = ENCRYPTION_KEY
+        .get()
+        .ok_or_else(|| anyhow!("Error: Encryption key not initialized"))?;
 
     read_key
         .seal_in_place_append_tag(nonce, additional_data, &mut in_out)
-        .expect("error encrypting");
+        .map_err(|_| anyhow!("Error: Failed to encrypt data"))?;
 
     let mut encrypted_data = nonce_bytes.to_vec();
     encrypted_data.extend_from_slice(&in_out);
@@ -145,13 +198,10 @@ fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<
         return Ok(());
     }
 
-    let total = results.len();
-    let total_db: i64 = almacen_dsl::almacen
-        .count()
-        .get_result(conexion)?;
+    let total_db: i64 = almacen_dsl::almacen.count().get_result(conexion)?;
+    let total = results.len() as u16;
 
     let mut tabla = Table::new();
-
     tabla
         .load_preset(UTF8_NO_BORDERS)
         .apply_modifier(UTF8_ROUND_CORNERS);
@@ -162,18 +212,23 @@ fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<
         Cell::new("Key").set_alignment(CellAlignment::Center),
     ]);
 
-    let read_key = load_key()?;
+    let read_key = ENCRYPTION_KEY
+        .get()
+        .ok_or_else(|| anyhow!("Error: Encryption key not initialized"))?;
+
+    let mut data_vec = Vec::with_capacity(28);
 
     for row in results {
         let (nonce_bytes, encrypted_data) = row.key.split_at(NONCE_LEN);
-        let nonce =
-            aead::Nonce::try_assume_unique_for_key(nonce_bytes).expect("error creating nonce");
+        let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes)
+            .map_err(|_| anyhow!("Error: Invalid nonce in stored data"))?;
 
-        let mut data_vec = encrypted_data.to_vec();
+        data_vec.clear();
+        data_vec.extend_from_slice(encrypted_data);
 
         let decrypted = read_key
             .open_in_place(nonce, aead::Aad::from(b""), &mut data_vec)
-            .expect("error decrypting");
+            .map_err(|_| anyhow!("Error: Failed to decrypt data"))?;
 
         tabla.add_row(cRow::from(vec![
             Cell::new(row.id),
@@ -184,7 +239,7 @@ fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<
         decrypted.zeroize();
     }
 
-    println!("{}\n", &tabla);
+    println!("{}", &tabla);
     println!(
         "Showing records from id {} to {} - Found: {} - DB Total: {}",
         &inicio, &fin, &total, total_db
@@ -197,16 +252,13 @@ fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .delimiter(b',')
-        .from_path(FILE_IMPORT)?;
+        .from_path(constantes::FILE_IMPORT)?;
 
     for line in reader.records() {
         let record = line?;
 
         if record[0].is_empty() {
-            println!(
-                "Error: '{}' has no name, skipped.",
-                &record[1][0..5]
-            );
+            println!("Error: '{}' has no name, skipped.", &record[1][0..5]);
             continue;
         } else if record[1].is_empty() {
             println!("Error: Empty key for name: '{}', skipped.", &record[0]);
@@ -228,9 +280,11 @@ fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
 
 fn export_all(conexion: &mut SqliteConnection) -> Result<()> {
     let results = almacen_dsl::almacen.load::<models::Almacen>(conexion)?;
-    let mut writer = csv::Writer::from_writer(File::create(FILE_EXPORT)?);
+    let mut writer = csv::Writer::from_writer(File::create(constantes::FILE_EXPORT)?);
 
-    let read_key = load_key()?;
+    let read_key = ENCRYPTION_KEY
+        .get()
+        .ok_or_else(|| anyhow!("Error: Encryption key not initialized"))?;
 
     for row in results {
         let (nonce_bytes, encrypted_data) = row.key.split_at(ring::aead::NONCE_LEN);
@@ -268,7 +322,7 @@ fn check_name(nombre: &str) -> bool {
 }
 
 fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
-    let data = "
+    let almacen_schema = "
         CREATE TABLE IF NOT EXISTS Almacen (
             id INTEGER PRIMARY KEY,
             nombre TEXT NOT NULL,
@@ -278,17 +332,25 @@ fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
     ";
 
-    diesel::sql_query(data).execute(conexion)?;
+    diesel::sql_query(almacen_schema).execute(conexion)?;
+
+    let users_schema = "
+        CREATE TABLE IF NOT EXISTS usermaster (
+            hash TEXT NOT NULL UNIQUE PRIMARY KEY
+        );
+    ";
+
+    diesel::sql_query(users_schema).execute(conexion)?;
     Ok(())
 }
 
 fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
-    let rows = diesel::delete(almacen_dsl::almacen
-        .filter(almacen_dsl::nombre.eq(&name)))
+    let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&name)))
         .execute(conexion)?;
 
     if rows == 0 {
         println!("Error: No record found with name '{}'", &name);
+        return Ok(());
     }
 
     println!("'{}' has been successfully deleted", &name);
@@ -298,13 +360,39 @@ fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
 pub fn init() -> Result<()> {
     print!("\x1B[2J\x1B[1;1H");
 
-    let status = !Path::new(KEY_PATH).exists();
+    let status = !Path::new(constantes::KEY_PATH).exists();
     let conex = &mut conexion(status)?;
 
     if status {
         create_schema(conex)?;
         create_key()?;
+
+        println!("New Password\n");
+
+        let password = prompts(Prompts::NewPassword)?;
+
+        new_pwd(conex, &password)?;
+    } else {
+        println!("Login\n");
+
+        let mut authenticated = false;
+
+        while !authenticated {
+            let password = prompts(Prompts::NewLogin)?;
+
+            match authenticate(conex, &password)? {
+                true => {
+                    authenticated = true;
+                }
+                false => {
+                    println!("Error: Wrong password\n");
+                }
+            }
+        }
     }
+
+    load_key()?;
+    print!("\x1B[2J\x1B[1;1H");
 
     loop {
         println!(
@@ -321,7 +409,7 @@ pub fn init() -> Result<()> {
 
         println!(" ");
 
-        let entrada = Text::new("\x1b[32m->\x1b[0m").prompt()?;
+        let entrada = prompts(Prompts::Init)?;
         let partes: Vec<&str> = entrada.split_whitespace().collect();
 
         match partes.as_slice() {

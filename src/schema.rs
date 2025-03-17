@@ -7,3 +7,9 @@ diesel::table! {
         key -> Binary,
     }
 }
+
+diesel::table! {
+    usermaster (hash) {
+        hash -> Text,
+    }
+}

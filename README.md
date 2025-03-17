@@ -1,48 +1,45 @@
 # Almacen
 
-Almacen is a Rust app designed to securely store and manage sensitive data using encryption. It utilizes SQLite for data storage and the Ring library for cryptographic operations.
-
-- **Private Directory**: Contains sensitive files, including the `private_key.bin` which stores the encryption key used for encrypt/decrypt data.
+A secure storage manager for private keys
 
 ## Features
 
-- Secure storage of confidential data in almacen.db using ChaCha20-Poly1305 encryption.
-- Command-line interface for adding, viewing, importing, and exporting data.
-- Memory locking to prevent sensitive data from being swapped to disk.
+- **Secure Encryption**: Uses ChaCha20-Poly1305 for data encryption
+- **Memory Protection**: Implements memory locking for sensitive data
+- **SQLite Storage**: Secure local database storage
+- **Password Protection**: Master password required for access
+- **Import/Export**: Support for CSV import and export
+- **Command Interface**: Simple command-line interface
 
-## Prerequisites
+## Commands
 
-- [Rust](https://rustup.rs)
+- `a [name] [key]` - Add new entry
+- `v [start] [end]` - View entries (paginated)
+- `r [name]` - Remove entry
+- `i` - Import from CSV
+- `e` - Export to CSV
+- `q` - Quit
 
-## Setup
+## Security Features
 
-Clone the repository
+- Memory protection for sensitive data
+- Secure key derivation
+- Protected file storage
+- Input validation and sanitization
+- Encrypted database entries
+- Secure password hashing
 
-```bash
-  git clone https://github.com/abr3lak3bra/almacen.git
-```
+## Technical Details
 
-Go to the project directory
+- **Database**: SQLite with Diesel ORM
+- **Encryption**: Ring crypto library (ChaCha20-Poly1305)
+- **Password Hashing**: Ring crypto library (PBKDF2_HMAC_SHA256)
+- **Maximum name length**: 9 characters
+- **Allowed characters**: Alphanumeric and underscores
 
-```bash
-  cd almacen
-```
+## Security Notes
 
-## Run
-
-```bash
-  cargo run
-```
-
-## Menu Usage
-```bash
-a -> Add -> Usage: a testi1 0xac....
-v -> View -> Usage: v 0 10 -> Display records from id 0 to 10
-i -> Import
-e -> Export
-r -> Remove -> Usage: r testi1
-q -> Quit
-```
-## Author
-
-- [abr3lak3bra](https://github.com/abr3lak3bra)
+- Master password is required for access
+- Data is encrypted at rest
+- Keys are protected in memory
+- Protected file operations
