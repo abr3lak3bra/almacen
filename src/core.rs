@@ -25,7 +25,7 @@ mod constantes;
 mod models;
 mod schema;
 
-pub enum Prompts {
+enum Prompts {
     NewPassword,
     NewLogin,
     Init,
@@ -37,11 +37,6 @@ fn lock_memory(data: &mut [u8]) {
     #[cfg(target_os = "windows")]
     unsafe {
         winapi::um::memoryapi::VirtualLock(data.as_ptr() as *mut _, data.len());
-    }
-
-    #[cfg(target_family = "unix")]
-    unsafe {
-        libc::mlock(data.as_ptr() as *const libc::c_void, data.len());
     }
 }
 
@@ -72,12 +67,8 @@ fn new_pwd(conexion: &mut SqliteConnection, pwd: &str) -> Result<()> {
 
 fn prompts(p: Prompts) -> Result<String> {
     match p {
-        Prompts::NewPassword => Ok(Password::new("New Password: ")
-            .with_display_mode(Masked)
-            .prompt()?),
-        Prompts::NewLogin => Ok(Password::new("Enter Password")
-            .without_confirmation()
-            .prompt()?),
+        Prompts::NewPassword => Ok(Password::new("New Password: ").with_display_mode(Masked).prompt()?),
+        Prompts::NewLogin => Ok(Password::new("Enter Password").without_confirmation().prompt()?),
         Prompts::Init => Ok(Text::new("\x1b[32m->\x1b[0m").prompt()?),
     }
 }

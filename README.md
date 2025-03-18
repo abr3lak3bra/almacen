@@ -1,4 +1,4 @@
-# Almacen
+# Almacen - Storage Manager
 
 A secure storage manager for private keys
 
@@ -10,6 +10,7 @@ A secure storage manager for private keys
 - **Password Protection**: Master password required for access
 - **Import/Export**: Support for CSV import and export
 - **Command Interface**: Simple command-line interface
+- **Platform**: Windows only
 
 ## Commands
 
