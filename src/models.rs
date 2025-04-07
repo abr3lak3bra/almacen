@@ -11,7 +11,7 @@ pub struct Almacen {
     pub key: Vec<u8>,
 }
 
-#[derive(ZeroizeOnDrop, Queryable)]
+#[derive(Queryable)]
 #[diesel(table_name = usermaster)]
 pub struct User {
     pub hash: String,

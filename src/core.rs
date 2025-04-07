@@ -5,7 +5,7 @@ use comfy_table::{
     modifiers::UTF8_ROUND_CORNERS, presets::UTF8_NO_BORDERS, Cell, CellAlignment, Row as cRow,
     Table,
 };
-use diesel::{dsl::exists, prelude::*, sqlite::SqliteConnection};
+use diesel::{dsl::exists, prelude::*, r2d2::Pool, r2d2::ConnectionManager, sqlite::SqliteConnection};
 use inquire::{Password, PasswordDisplayMode::Masked, Text};
 use ring::{
     aead::{self, LessSafeKey, CHACHA20_POLY1305, NONCE_LEN},
@@ -40,15 +40,22 @@ fn lock_memory(data: &mut [u8]) {
     }
 }
 
-fn conexion(status: bool) -> Result<SqliteConnection> {
+fn conexion(status: bool) -> Result<Pool<ConnectionManager<SqliteConnection>>> {
     if status {
         fs::create_dir(constantes::DB_PATH)?;
     }
-    Ok(SqliteConnection::establish(constantes::DB)?)
+
+    let manager = ConnectionManager::<SqliteConnection>::new(constantes::DB);
+    let pool = Pool::builder()
+        .max_size(1)
+        .build(manager)
+        .map_err(|_| anyhow!("Error: Error creating connection pool"))?;
+
+    Ok(pool)
 }
 
-fn authenticate(conexion: &mut SqliteConnection, password: &str) -> Result<bool> {
-    let result = users_dsl::usermaster.first::<models::User>(conexion);
+fn authenticate(conexion: &Pool<ConnectionManager<SqliteConnection>>, password: &str) -> Result<bool> {
+    let result = users_dsl::usermaster.first::<models::User>(&mut conexion.get()?);
 
     match result {
         Ok(user) => auth::verify_pwd(password, &user.hash),
@@ -56,12 +63,12 @@ fn authenticate(conexion: &mut SqliteConnection, password: &str) -> Result<bool>
     }
 }
 
-fn new_pwd(conexion: &mut SqliteConnection, pwd: &str) -> Result<()> {
+fn new_pwd(conexion: &Pool<ConnectionManager<SqliteConnection>>, pwd: &str) -> Result<()> {
     let hash = auth::hash_pwd(pwd)?;
 
     diesel::insert_into(users_dsl::usermaster)
         .values(models::NewUser { hash: &hash })
-        .execute(conexion)?;
+        .execute(&mut conexion.get()?)?;
     Ok(())
 }
 
@@ -152,7 +159,9 @@ fn encrypt_data(data: &[u8]) -> Result<Vec<u8>> {
     Ok(encrypted_data)
 }
 
-fn add(conexion: &mut SqliteConnection, data: &models::Almacen) -> Result<()> {
+fn add(conexion: &Pool<ConnectionManager<SqliteConnection>>, data: &models::Almacen) -> Result<()> {
+    let mut conn = conexion.get()?;
+    
     if !check_name(&data.nombre) {
         return Ok(());
     }
@@ -160,7 +169,7 @@ fn add(conexion: &mut SqliteConnection, data: &models::Almacen) -> Result<()> {
     if diesel::select(exists(
         almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&data.nombre)),
     ))
-    .get_result::<bool>(conexion)?
+    .get_result::<bool>(&mut conn)?
     {
         println!("Error: '{}' already exist, skipped.", &data.nombre);
         return Ok(());
@@ -173,23 +182,24 @@ fn add(conexion: &mut SqliteConnection, data: &models::Almacen) -> Result<()> {
             nombre: &data.nombre,
             key: &encrypted,
         })
-        .execute(conexion)?;
+        .execute(&mut conn)?;
 
     Ok(())
 }
 
-fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<()> {
+fn view_all(conexion: &Pool<ConnectionManager<SqliteConnection>>, inicio: &u16, fin: &u16) -> Result<()> {
+    let mut conn = conexion.get()?;
     let results = almacen_dsl::almacen
         .limit((fin - inicio) as i64)
         .offset(*inicio as i64)
-        .load::<models::Almacen>(conexion)?;
+        .load::<models::Almacen>(&mut conn)?;
 
     if results.is_empty() {
         println!("Error: No records found in the specified range");
         return Ok(());
     }
 
-    let total_db: i64 = almacen_dsl::almacen.count().get_result(conexion)?;
+    let total_db: i64 = almacen_dsl::almacen.count().get_result(&mut conn)?;
     let total = results.len() as u16;
 
     let mut tabla = Table::new();
@@ -239,7 +249,7 @@ fn view_all(conexion: &mut SqliteConnection, inicio: &u16, fin: &u16) -> Result<
     Ok(())
 }
 
-fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
+fn import_all(conexion: &Pool<ConnectionManager<SqliteConnection>>) -> Result<()> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .delimiter(b',')
@@ -269,8 +279,8 @@ fn import_all(conexion: &mut SqliteConnection) -> Result<()> {
     Ok(())
 }
 
-fn export_all(conexion: &mut SqliteConnection) -> Result<()> {
-    let results = almacen_dsl::almacen.load::<models::Almacen>(conexion)?;
+fn export_all(conexion: &Pool<ConnectionManager<SqliteConnection>>) -> Result<()> {
+    let results = almacen_dsl::almacen.load::<models::Almacen>(&mut conexion.get()?)?;
     let mut writer = csv::Writer::from_writer(File::create(constantes::FILE_EXPORT)?);
 
     let read_key = ENCRYPTION_KEY
@@ -312,7 +322,8 @@ fn check_name(nombre: &str) -> bool {
     true
 }
 
-fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
+fn create_schema(conexion: &Pool<ConnectionManager<SqliteConnection>>) -> Result<()> {
+    let mut conn = conexion.get()?;
     let almacen_schema = "
         CREATE TABLE IF NOT EXISTS Almacen (
             id INTEGER PRIMARY KEY,
@@ -323,21 +334,21 @@ fn create_schema(conexion: &mut SqliteConnection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS id_nombre ON Almacen(nombre);
     ";
 
-    diesel::sql_query(almacen_schema).execute(conexion)?;
+    diesel::sql_query(almacen_schema).execute(&mut conn)?;
 
-    let users_schema = "
+    let user_schema = "
         CREATE TABLE IF NOT EXISTS usermaster (
             hash TEXT NOT NULL UNIQUE PRIMARY KEY
         );
     ";
 
-    diesel::sql_query(users_schema).execute(conexion)?;
+    diesel::sql_query(user_schema).execute(&mut conn)?;
     Ok(())
 }
 
-fn remove(conexion: &mut SqliteConnection, name: &str) -> Result<()> {
+fn remove(conexion: &Pool<ConnectionManager<SqliteConnection>>, name: &str) -> Result<()> {
     let rows = diesel::delete(almacen_dsl::almacen.filter(almacen_dsl::nombre.eq(&name)))
-        .execute(conexion)?;
+        .execute(&mut conexion.get()?)?;
 
     if rows == 0 {
         println!("Error: No record found with name '{}'", &name);
